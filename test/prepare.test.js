@@ -100,7 +100,7 @@ function mcpServer(mode = 'modern', { tools = TOOLS.tools, log = [] } = {}) {
   };
 }
 
-async function world({ registry = {}, site = {}, httpKeys = { keys: published, notes: [] }, dnsKeys = { keys: [], notes: ['no TXT records at example.com'] } } = {}) {
+async function world({ registry = {}, site = {}, httpKeys = { keys: published, notes: [] }, dnsKeys = { keys: [], notes: ['no TXT records at example.com'] }, extraDeps = {} } = {}) {
   const seen = [];
   const reg = await serve(registry, seen);
   const st = await serve(site, seen);
@@ -116,6 +116,7 @@ async function world({ registry = {}, site = {}, httpKeys = { keys: published, n
     keysFromHttp: async (domain) => (lookups.push(['http', domain]), typeof httpKeys === 'function' ? httpKeys(domain) : httpKeys),
     keysFromDns: async (domain) => (lookups.push(['dns', domain]), typeof dnsKeys === 'function' ? dnsKeys(domain) : dnsKeys),
     dnsResolverFor: () => ({}),
+    ...extraDeps,
   };
   const registryUrl = `http://127.0.0.1:${reg.port}`;
   return {
@@ -1503,4 +1504,430 @@ test('round 3: check-listing still reads a long name of mixed case words, and th
     }
   }
   assert.match(HELP_PREPARE, /neither follows nor precedes latest\.json/);
+});
+
+
+// --histor-tool-sets: the member HISTOR, a third party watcher, reads from the
+// publisher metadata (lib/histor-tool-sets.js), next to the signed pointer.
+
+const HM = 'dev.modelmarket.histor/tool-sets';
+const HISTOR_SET = { mtl: '1', sets: [{ digest: tsd.contract.digest, count: TOOLS.tools.length }] };
+const OTHER_DIGEST = 'sha256-' + 'A'.repeat(43) + '=';
+const plainText = (s) => s.replace(/--[a-z]/g, '').replace(/https?:\/\/\S+/g, '');
+
+test('--histor-tool-sets off: pointer.json, --json and NEXT_STEPS are as before, and a listing member of that name is carried as it is', async () => {
+  const out = freshOut();
+  const listed = { tier: 'free', [HM]: { mtl: '1', sets: [{ digest: OTHER_DIGEST }] } };
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: listingFor({ meta: { [PP]: listed } }) } }), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out, '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.ok(!Object.hasOwn(r.json, 'historToolSets'), 'no new member in --json without the option');
+    assert.deepEqual(Object.keys(r.json.pointer.meta[PP]), ['tier', HM, 'addonDeclaration']);
+    assert.deepEqual(r.json.pointer.meta[PP][HM], listed[HM], 'carried unchanged');
+    assert.deepEqual(r.json.pointer.carried, ['tier', HM]);
+    assert.ok(!r.json.steps.some((s) => s.line.includes(HM)));
+  }, { env: ENV });
+  assert.ok(!readOut(out, 'NEXT_STEPS.txt').includes('HISTOR'));
+});
+
+test('--histor-tool-sets on: pointer.json carries the member next to the pointer, step 9 checks it, and check-listing reports it for information', async () => {
+  const out = freshOut();
+  let json;
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out, '--histor-tool-sets', '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    json = r.json;
+    assertNoSecrets(r.stdout, r.stderr);
+  }, { env: ENV });
+  const signed = JSON.parse(readOut(out, `site/.well-known/addon-declaration/${NAME}/latest.json`));
+  const pointer = JSON.parse(readOut(out, 'pointer.json'));
+  assert.deepEqual(pointer, { _meta: { [PP]: { addonDeclaration: { url: `https://${HOST}${folder}by-hash/${hex(signed)}.json`, hash: declarationHash(signed) }, [HM]: HISTOR_SET } } });
+  assert.equal(pointer._meta[PP][HM].sets[0].digest, signed.toolSetDigest.contract, 'the digest the declaration signs');
+  assert.equal(json.historToolSets.check, 'passed');
+  assert.deepEqual(json.historToolSets.problems, []);
+  assert.deepEqual(json.historToolSets.value, HISTOR_SET);
+  assert.equal(json.historToolSets.existing, null);
+  assert.equal(json.historToolSets.toolCount, 2);
+  assert.equal(json.historToolSets.watcher, 'https://histor.modelmarket.dev');
+  assert.equal(json.pointer.bytes, Buffer.byteLength(JSON.stringify(pointer._meta[PP])));
+  assert.match(json.steps.find((s) => s.step === 8).line, /pointer\.json \(\d+ of 4096 bytes, with the "dev\.modelmarket\.histor\/tool-sets" member\)/);
+  assert.ok(json.steps.find((s) => s.step === 9).line.includes(`the "${HM}" member in pointer.json names ${tsd.contract.digest}, equal to the contract digest the declaration signs, with the count of 2 tools signed (the member itself is not signed)`));
+  // The declaration itself has the members a run without the option signs.
+  assert.deepEqual(Object.keys(signed), ['spec', 'name', 'version', 'toolSetDigest', 'remotes', 'issuedAt', 'expiresAt', 'key', 'signature']);
+  const next = readOut(out, 'NEXT_STEPS.txt');
+  assert.match(next, /HISTOR, a third party watcher of MCP servers \(https:\/\/histor\.modelmarket\.dev\)/);
+  assert.match(next, /The member is not signed and is not part of the declaration: it is a statement by the publisher/);
+  assert.match(next, /The signed declaration is what shows who made the statement about the tool list/);
+  assert.ok(next.includes(tsd.contract.digest));
+  assert.ok(!/\s-\s|\s--\s|[‒-―−]/.test(plainText(next)), 'no dash punctuation');
+  assert.ok(!/\b(never|guaranteed|safe|secure|trusted|consultant)\b/i.test(next), 'no barred word');
+
+  // After the upload and the publication: check-listing reads the member for information only.
+  const newListing = listingFor({ version: '1.0.1' });
+  newListing.server._meta = pointer._meta;
+  const w2 = await world({ registry: { [regPath('1.0.1')]: { body: newListing } }, site: uploadedSite(out, { [`POST ${HOST}/mcp`]: mcpServer() }) });
+  try {
+    const c = await w2.run([NAME, '--version', '1.0.1', '--registry', w2.registryUrl, '--fetch-tools', '--now', NOW], { command: 'check-listing' });
+    assert.equal(c.code, 0, c.stdout + c.stderr);
+    assert.match(c.stdout, /^verified: /);
+    assert.match(c.stdout, /\n {2}dev\.modelmarket\.histor\/tool-sets \(for information, not part of this check\): 1 set HISTOR takes; its digests equal the contract digest of the declaration in force\n/);
+    const j = await w2.run([NAME, '--version', '1.0.1', '--registry', w2.registryUrl, '--now', NOW, '--json'], { command: 'check-listing' });
+    assert.equal(j.json.historToolSets.matches, 'all');
+    assert.equal(j.json.historToolSets.comparedWith, declarationHash(signed));
+    assert.deepEqual(j.json.historToolSets.digests, [tsd.contract.digest]);
+  } finally {
+    await w2.close();
+  }
+  // A member whose digest differs changes no state of check-listing.
+  const changed = listingFor({ version: '1.0.1' });
+  changed.server._meta = { [PP]: { ...pointer._meta[PP], [HM]: { mtl: '1', sets: [{ digest: OTHER_DIGEST }] } } };
+  const w3 = await world({ registry: { [regPath('1.0.1')]: { body: changed } }, site: uploadedSite(out) });
+  try {
+    const c = await w3.run([NAME, '--version', '1.0.1', '--registry', w3.registryUrl, '--now', NOW, '--json'], { command: 'check-listing' });
+    assert.equal(c.code, 0, c.stdout + c.stderr);
+    assert.equal(c.json.state, 'verified');
+    assert.equal(c.json.historToolSets.matches, 'none');
+    const t = await w3.run([NAME, '--version', '1.0.1', '--registry', w3.registryUrl, '--now', NOW], { command: 'check-listing' });
+    assert.equal(t.code, 0);
+    assert.match(t.stdout, /tool-sets \(for information, not part of this check\): 1 set HISTOR takes; none of its digests equals the contract digest of the declaration in force/);
+  } finally {
+    await w3.close();
+  }
+  // A listing without the member: null in --json, and no line.
+  const bare = listingFor({ version: '1.0.1' });
+  bare.server._meta = { [PP]: { addonDeclaration: pointer._meta[PP].addonDeclaration } };
+  const w4 = await world({ registry: { [regPath('1.0.1')]: { body: bare } }, site: uploadedSite(out) });
+  try {
+    const c = await w4.run([NAME, '--version', '1.0.1', '--registry', w4.registryUrl, '--now', NOW, '--json'], { command: 'check-listing' });
+    assert.equal(c.code, 0, c.stdout + c.stderr);
+    assert.equal(c.json.historToolSets, null);
+    const t = await w4.run([NAME, '--version', '1.0.1', '--registry', w4.registryUrl, '--now', NOW], { command: 'check-listing' });
+    assert.ok(!t.stdout.includes(HM));
+  } finally {
+    await w4.close();
+  }
+});
+
+test('--histor-tool-sets merges into a member of that name in the listing: its other sets, their when and its url are kept, so HISTOR withdraws none', async () => {
+  const D2 = 'sha256-' + 'B'.repeat(43) + '=';
+  const listed = {
+    tier: 'free',
+    [HM]: {
+      mtl: '1',
+      sets: [
+        { digest: OTHER_DIGEST, count: 9, when: 'the runner is installed' },
+        { digest: tsd.contract.digest, count: 1, when: 'a key is set' },
+        { digest: 'sha256:' + 'ab'.repeat(32) },
+        { digest: D2 },
+        { digest: OTHER_DIGEST },
+      ],
+      url: 'https://example.com/.well-known/mcp-tool-sets.json',
+      note: 'kept by nobody',
+    },
+  };
+  const out = freshOut();
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: listingFor({ meta: { [PP]: listed } }) } }), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out, '--histor-tool-sets', '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.deepEqual(Object.keys(r.json.pointer.meta[PP]), ['tier', HM, 'addonDeclaration']);
+    assert.deepEqual(r.json.pointer.meta[PP][HM], {
+      mtl: '1',
+      sets: [
+        { digest: tsd.contract.digest, count: 2, when: 'a key is set' },
+        { digest: OTHER_DIGEST, count: 9, when: 'the runner is installed' },
+        { digest: D2 },
+      ],
+      url: 'https://example.com/.well-known/mcp-tool-sets.json',
+    }, 'the set signed here first, every other set HISTOR reads and the url kept');
+    assert.deepEqual(r.json.pointer.carried, ['tier']);
+    assert.equal(r.json.historToolSets.check, 'passed');
+    assert.deepEqual(r.json.historToolSets.existing, {
+      source: 'the listing of 1.0.0',
+      action: 'merged',
+      keptSets: [OTHER_DIGEST, D2],
+      keptWhen: true,
+      keptUrl: 'https://example.com/.well-known/mcp-tool-sets.json',
+      urlRefused: null,
+      leftOut: [
+        'the member "note", which HISTOR does not read',
+        'sets[2]: digest is not an MTL/1 tool-set digest (sha256-<base64>) (HISTOR skips it too)',
+        'sets[4]: the same digest twice (HISTOR skips it too)',
+      ],
+    });
+    assert.ok(r.json.notes.includes(`the listing of 1.0.0 already has a "${HM}" member; pointer.json merges the set signed here into it as its first set (--histor-tool-sets) and keeps the 2 other sets HISTOR reads from it (${OTHER_DIGEST}, ${D2}) and its "url", with the "when" it gives for the digest signed here, so HISTOR marks none of them withdrawn`), r.json.notes.join('\n'));
+    assert.ok(r.json.notes.some((n) => n.startsWith('pointer.json leaves out what HISTOR does not read from that member: the member "note"')));
+    assert.ok(r.json.steps.find((s) => s.step === 9).line.includes(', and keeps 2 other sets from the listing of 1.0.0 (the member itself is not signed)'));
+  }, { env: ENV });
+  const next = readOut(out, 'NEXT_STEPS.txt');
+  assert.match(next, /it is the member of that name in the listing of 1\.0\.0 with this set added first/);
+  assert.match(next, /It also keeps the 2 other sets that member declares and its "url", and the "when" that member gives for this digest, so HISTOR marks none of them withdrawn\./);
+  assert.match(next, /HISTOR uses the member for tool sets it has not observed itself/);
+  assert.ok(!/\s-\s|\s--\s|[‒-―−]/.test(plainText(next)), 'no dash punctuation');
+  assert.ok(!/\b(never|guaranteed|safe|secure|trusted|consultant)\b/i.test(next), 'no barred word');
+
+  // A url HISTOR does not read is kept as it is, with a note that says why.
+  const offDomain = { [HM]: { mtl: '1', url: 'https://other.example.net/sets.json' } };
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: listingFor({ meta: { [PP]: offDomain } }) } }), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', freshOut(), '--histor-tool-sets', '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.deepEqual(r.json.pointer.meta[PP][HM], { ...HISTOR_SET, url: 'https://other.example.net/sets.json' });
+    assert.equal(r.json.historToolSets.existing.urlRefused, '"url" must be on example.com or a subdomain, the domain the registry verified for com.example');
+    assert.ok(r.json.notes.some((n) => n.startsWith('the "url" of that member is kept as it is, although HISTOR does not read it: "url" must be on example.com')));
+  }, { env: ENV });
+
+  // A member HISTOR reads nothing from is replaced, with a note that says why.
+  const sj = path.join(tmp, 'server-histor.json');
+  fs.writeFileSync(sj, JSON.stringify({ name: NAME, version: '1.0.1', remotes: [{ type: 'streamable-http', url: REMOTE }], _meta: { [PP]: { [HM]: 'not an object' } } }));
+  const out2 = freshOut();
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--server-json', sj, '--key-env', 'MCP_PRIVATE_KEY', '--out', out2, '--histor-tool-sets'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /note: the server\.json given already has a "dev\.modelmarket\.histor\/tool-sets" member; it is not a JSON object, so HISTOR reads nothing from it, and pointer\.json replaces it/);
+  }, { env: ENV });
+  assert.deepEqual(JSON.parse(readOut(out2, 'pointer.json'))._meta[PP][HM], HISTOR_SET);
+  assert.match(readOut(out2, 'NEXT_STEPS.txt'), /it replaces the member of that name in the server\.json given, which HISTOR reads nothing from/);
+  fs.writeFileSync(sj, JSON.stringify({ name: NAME, version: '1.0.1', remotes: [{ type: 'streamable-http', url: REMOTE }], _meta: { [PP]: { [HM]: { mtl: 1, sets: [{ digest: OTHER_DIGEST }] } } } }));
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--server-json', sj, '--out', freshOut(), '--histor-tool-sets', '--dry-run', '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.deepEqual(r.json.pointer.meta[PP][HM], HISTOR_SET);
+    assert.equal(r.json.historToolSets.existing.action, 'replaced');
+    assert.ok(r.json.notes.includes(`the server.json given already has a "${HM}" member; its "mtl" is not "1", so HISTOR reads nothing from it, and pointer.json would replace it with the one built from the tool list signed here (--histor-tool-sets)`), r.json.notes.join('\n'));
+  });
+});
+
+test('--histor-tool-sets: a member with 8 other sets HISTOR reads stops the run before signing, naming the sets that would be dropped', async () => {
+  const eight = Array.from({ length: 8 }, (_, i) => ({ digest: `sha256-${String.fromCharCode(66 + i).repeat(43)}=`, ...(i === 7 ? { when: 'on arm64' } : {}) }));
+  const listed = { [HM]: { mtl: '1', sets: eight, url: 'https://example.com/s.json' } };
+  for (const extra of [['--key-env', 'MCP_PRIVATE_KEY'], ['--dry-run']]) {
+    const out = freshOut();
+    await scenario({ registry: baseRegistry({ [regPath()]: { body: listingFor({ meta: { [PP]: listed } }) } }), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--out', out, '--histor-tool-sets', ...extra], (r) => {
+      assert.equal(r.code, 1, r.stdout + r.stderr);
+      assert.match(r.stderr, /--histor-tool-sets: the listing of 1\.0\.0 already has a "dev\.modelmarket\.histor\/tool-sets" member with 8 sets HISTOR reads, and HISTOR reads at most 8 there\. Adding the set signed here would drop these sets, which HISTOR would then mark withdrawn:/);
+      assert.ok(r.stderr.includes(`${eight[7].digest} (when: "on arm64")`), r.stderr);
+      assert.match(r.stderr, /nothing was signed or written/);
+    }, { env: ENV });
+    assert.deepEqual(filesUnder(out), []);
+  }
+  // Seven fit: the run goes on, and the member holds 8 sets.
+  const seven = { [HM]: { mtl: '1', sets: eight.slice(0, 7) } };
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: listingFor({ meta: { [PP]: seven } }) } }), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', freshOut(), '--histor-tool-sets', '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.json.pointer.meta[PP][HM].sets.length, 8);
+    assert.equal(r.json.historToolSets.check, 'passed');
+  }, { env: ENV });
+});
+
+test('histor-tool-sets.js: what check-listing reports is what HISTOR takes (parse_sets and url_refusal)', async () => {
+  const H = await import('../lib/histor-tool-sets.js');
+  const hex = H.readHistorMember({ mtl: '1', sets: [{ digest: 'sha256:' + 'ab'.repeat(32) }] }, NAME);
+  assert.equal(hex.readable, false, 'a digest in the hex form is not read by HISTOR');
+  assert.deepEqual(hex.digests, []);
+  assert.match(hex.problem, /HISTOR takes no set and no url from it: sets\[0\]: digest is not an MTL\/1 tool-set digest/);
+  const evil = H.readHistorMember({ mtl: '1', url: 'https://evil.example/x.json' }, NAME);
+  assert.equal(evil.readable, false);
+  assert.equal(evil.urlRefused, '"url" must be on example.com or a subdomain, the domain the registry verified for com.example');
+  const twelve = H.readHistorMember({ mtl: '1', sets: Array.from({ length: 12 }, () => ({ digest: tsd.contract.digest })) }, NAME);
+  assert.equal(twelve.sets, 1);
+  assert.deepEqual(twelve.digests, [tsd.contract.digest]);
+  assert.equal(twelve.skipped.length, 11);
+  const many = H.readHistorMember({ mtl: '1', sets: Array.from({ length: 10 }, (_, i) => ({ digest: `sha256-${String.fromCharCode(66 + i).repeat(43)}=` })) }, NAME);
+  assert.equal(many.sets, 8);
+  assert.deepEqual(many.skipped, ['sets[8:]: more than 8 sets']);
+  for (const count of [true, -1, 5001, 1.5, '2']) {
+    assert.equal(H.readHistorMember({ mtl: '1', sets: [{ digest: tsd.contract.digest, count }] }, NAME).readable, false, `count ${JSON.stringify(count)}`);
+  }
+  assert.equal(H.readHistorMember({ mtl: '1', sets: [{ digest: tsd.contract.digest, count: null }] }, NAME).sets, 1, 'a null count is no count');
+  assert.equal(H.readHistorMember({ mtl: '1', sets: [] }, NAME).readable, false);
+  // url_refusal
+  const R = H.historUrlRefusal;
+  assert.equal(R('https://example.com/.well-known/mcp-tool-sets.json', NAME), null);
+  assert.equal(R('https://sets.example.com/a.json', NAME), null);
+  assert.equal(R('https://example.com:443/a.json', NAME), null);
+  assert.match(R('https://notexample.com/a.json', NAME), /must be on example\.com or a subdomain/);
+  assert.match(R('http://example.com/a.json', NAME), /must be https/);
+  assert.match(R('https://u:p@example.com/a.json', NAME), /credentials/);
+  assert.match(R('https://example.com:8443/a.json', NAME), /default https port/);
+  assert.match(R(42, NAME), /must be an https URL/);
+  assert.equal(R('https://alice.github.io/sets.json', 'io.github.alice/srv'), null);
+  assert.equal(R('https://raw.githubusercontent.com/alice/repo/main/sets.json', 'io.github.alice/srv'), null);
+  assert.match(R('https://raw.githubusercontent.com/bob/repo/main/sets.json', 'io.github.alice/srv'), /under \/alice\//);
+  assert.match(R('https://example.com/a.json', 'localhost/x'), /no domain HISTOR can bind/);
+});
+
+test('histor-tool-sets.js: the merge keeps what HISTOR reads, and the self check covers count, members, order and carried sets', async () => {
+  const H = await import('../lib/histor-tool-sets.js');
+  const digests = { spec: 'mcp-tool-set-digest/1', contract: tsd.contract.digest, extras: tsd.extras.digest };
+  const built = { mtl: '1', sets: [{ digest: tsd.contract.digest, count: 2 }] };
+  assert.equal(H.mergeHistorMember(built, undefined, NAME).action, 'added');
+  const m = H.mergeHistorMember(built, { mtl: '1', sets: [{ digest: OTHER_DIGEST, when: 'w' }], url: 'https://example.com/s.json' }, NAME);
+  assert.deepEqual(m.value, { mtl: '1', sets: [{ digest: tsd.contract.digest, count: 2 }, { digest: OTHER_DIGEST, when: 'w' }], url: 'https://example.com/s.json' });
+  assert.deepEqual(built.sets[0], { digest: tsd.contract.digest, count: 2 }, 'the built member is not changed');
+  assert.deepEqual(H.historMemberProblems(m.value, digests, 2, m.carried), []);
+  assert.ok(H.historMemberProblems(m.value, digests, 2).some((p) => /neither the contract digest/.test(p)), 'a set not carried is refused');
+  assert.ok(H.historMemberProblems(m.value, digests, 2, { digests: [OTHER_DIGEST], url: 'https://example.com/other.json' }).some((p) => /"url" is not the one carried/.test(p)));
+  assert.ok(H.historMemberProblems({ mtl: '1', sets: [{ digest: OTHER_DIGEST }, { digest: tsd.contract.digest, count: 2 }] }, digests, 2, { digests: [OTHER_DIGEST] }).some((p) => /sets\[0\]\.digest is/.test(p)), 'the signed set comes first');
+  assert.ok(H.historMemberProblems({ mtl: '1', sets: [{ digest: tsd.contract.digest, count: true }] }, digests, 2).some((p) => /count is true, not an integer from 0 to 5000/.test(p)));
+  assert.ok(H.historMemberProblems({ mtl: '1', sets: [{ digest: tsd.contract.digest }], extra: 1 }, digests, 2).some((p) => /the member "extra", which HISTOR does not read/.test(p)));
+  assert.ok(H.historMemberProblems({ mtl: '1', sets: [{ digest: tsd.contract.digest }, { digest: tsd.contract.digest }] }, digests, 2).some((p) => /same digest as an earlier set/.test(p)));
+  const full = H.mergeHistorMember(built, { mtl: '1', sets: Array.from({ length: 8 }, (_, i) => ({ digest: `sha256-${String.fromCharCode(66 + i).repeat(43)}=` })) }, NAME);
+  assert.equal(full.overflow.length, 1);
+  assert.equal(full.value.sets.length, 8);
+  const same = H.mergeHistorMember(built, { mtl: '1', sets: [{ digest: tsd.contract.digest, count: 7 }] }, NAME);
+  assert.deepEqual(same.value, built, 'a set with the digest signed here gives way to it');
+  assert.deepEqual(same.keptSets, []);
+});
+
+test('check-listing: the HISTOR line says why nothing was compared when the check stopped before a declaration verified', async () => {
+  const out = freshOut();
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out, '--histor-tool-sets'], (r) => assert.equal(r.code, 0, r.stdout + r.stderr), { env: ENV });
+  const pointer = JSON.parse(readOut(out, 'pointer.json'));
+  const listing = listingFor({ version: '1.0.1' });
+  listing.server._meta = pointer._meta;
+  const w = await world({ registry: { [regPath('1.0.1')]: { body: listing } }, site: uploadedSite(out) });
+  try {
+    // Long after the declaration expired.
+    const j = await w.run([NAME, '--version', '1.0.1', '--registry', w.registryUrl, '--now', '2030-01-01T00:00:00Z', '--json'], { command: 'check-listing' });
+    assert.notEqual(j.json.state, 'verified');
+    assert.equal(j.json.historToolSets.matches, null);
+    assert.equal(j.json.historToolSets.notCompared, `the check stopped at ${j.json.state}, before a declaration in force verified`);
+    const t = await w.run([NAME, '--version', '1.0.1', '--registry', w.registryUrl, '--now', '2030-01-01T00:00:00Z'], { command: 'check-listing' });
+    assert.ok(t.stdout.includes(`1 set HISTOR takes; not compared (the check stopped at ${j.json.state}, before a declaration in force verified)`), t.stdout);
+  } finally {
+    await w.close();
+  }
+  // A member whose only digest is in the hex form: HISTOR reads nothing from it.
+  const hexListing = listingFor({ version: '1.0.1' });
+  hexListing.server._meta = { [PP]: { ...pointer._meta[PP], [HM]: { mtl: '1', sets: [{ digest: 'sha256:' + 'ab'.repeat(32) }] } } };
+  const w2 = await world({ registry: { [regPath('1.0.1')]: { body: hexListing } }, site: uploadedSite(out) });
+  try {
+    const t = await w2.run([NAME, '--version', '1.0.1', '--registry', w2.registryUrl, '--now', NOW, '--json'], { command: 'check-listing' });
+    assert.equal(t.json.state, 'verified');
+    assert.equal(t.json.historToolSets.readable, false);
+    assert.equal(t.json.historToolSets.notCompared, 'it names no digest in the form HISTOR reads');
+    const x = await w2.run([NAME, '--version', '1.0.1', '--registry', w2.registryUrl, '--now', NOW], { command: 'check-listing' });
+    assert.match(x.stdout, /tool-sets \(for information, not part of this check\): present, but HISTOR reads nothing from it \(HISTOR takes no set and no url from it: sets\[0\]: digest is not an MTL\/1 tool-set digest/);
+  } finally {
+    await w2.close();
+  }
+});
+
+test('prepare --help: the --histor-tool-sets paragraph wraps like the other lines and says the check runs when the declaration is signed', () => {
+  const lines = HELP_PREPARE.split('\n');
+  const at = lines.findIndex((l) => l.trimStart().startsWith('--histor-tool-sets (pointer mode only'));
+  assert.ok(at > 0);
+  const para = [];
+  for (let i = at; i < lines.length && lines[i].startsWith('      '); i++) para.push(lines[i]);
+  assert.ok(para.length > 3);
+  for (const l of para.slice(0, -1)) assert.ok(l.length >= 62 && l.length <= 76, `uneven line (${l.length}): ${l}`);
+  assert.match(para.join(' ').replace(/\s+/g, ' '), /When the declaration is signed, the check step confirms that its digest equals the declaration's contract digest\./);
+  assert.match(para.join(' ').replace(/\s+/g, ' '), /HISTOR uses the member for tool sets it has not observed itself/);
+});
+
+test('--histor-tool-sets: the limit of 4096 bytes covers the whole block, the member included', async () => {
+  // A block that fits without the member and does not fit with it.
+  const pointerOnly = Buffer.byteLength(JSON.stringify({ notes: '', addonDeclaration: { url: `https://${HOST}${folder}by-hash/${'0'.repeat(64)}.json`, hash: `sha256:${'0'.repeat(64)}` } }));
+  const fill = 4096 - pointerOnly - 10;
+  const sj = path.join(tmp, 'server-near-limit.json');
+  fs.writeFileSync(sj, JSON.stringify({ name: NAME, version: '1.0.1', remotes: [{ type: 'streamable-http', url: REMOTE }], _meta: { [PP]: { notes: 'x'.repeat(fill) } } }));
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--server-json', sj, '--out', freshOut(), '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.json.pointer.bytes, 4086);
+  });
+  for (const keyArgs of [['--key-env', 'MCP_PRIVATE_KEY'], [], ['--dry-run']]) {
+    const out = freshOut();
+    await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--server-json', sj, '--out', out, '--histor-tool-sets', ...keyArgs], (r) => {
+      assert.equal(r.code, PREPARE_STATES.pointer_too_large, r.stdout + r.stderr);
+      assert.match(r.stdout, /^pointer_too_large: /);
+      assert.match(r.stdout, /at most 4096 bytes/);
+      assert.match(r.stdout, /the "dev\.modelmarket\.histor\/tool-sets" member \(--histor-tool-sets\) about \d+ bytes, and the block carries 1 other member of the server\.json given; make them smaller or move them out, or leave out --histor-tool-sets/);
+    }, { env: ENV });
+    assert.deepEqual(filesUnder(out), []);
+  }
+});
+
+test('--histor-tool-sets: usage errors are reported before any request', async () => {
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.0', '--no-pointer', '--histor-tool-sets', '--key-env', 'MCP_PRIVATE_KEY', '--out', freshOut()], (r, w) => {
+    assert.equal(r.code, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /--histor-tool-sets cannot be given with --no-pointer/);
+    assert.equal(w.seen.length, 0);
+    assert.deepEqual(w.lookups, []);
+  }, { env: ENV });
+  // check-listing does not take it.
+  const c = await cli(['check-listing', NAME, '--histor-tool-sets']);
+  assert.equal(c.code, 1);
+  assert.match(c.stderr, /--histor-tool-sets is not an option of check-listing/);
+  // prepare() itself refuses the pair too, before any request.
+  const { prepare } = await import('../lib/prepare.js');
+  await assert.rejects(prepare({ name: NAME, registry: registryBase(DEFAULT_REGISTRY), forVersion: '1.0.0', noPointer: true, historToolSets: true, outDir: freshOut(), request: async () => assert.fail('no request'), keyLookup: async () => assert.fail('no lookup') }), /--histor-tool-sets cannot be given with --no-pointer/);
+  assert.match(HELP_PREPARE, /--histor-tool-sets/);
+  assert.match(HELP_PREPARE.replace(/\s+/g, ' '), /HISTOR, a third party watcher of MCP servers \(https:\/\/histor\.modelmarket\.dev\)/);
+});
+
+test('--histor-tool-sets in a dry run and an unsigned run: no pointer.json, and a note shows the member', async () => {
+  for (const extra of [['--dry-run', '--key-env', 'MCP_PRIVATE_KEY'], []]) {
+    const out = freshOut();
+    await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--out', out, '--histor-tool-sets', '--json', ...extra], (r) => {
+      assert.equal(r.code, 0, r.stdout + r.stderr);
+      assert.equal(r.json.state, 'prepared_unsigned');
+      assert.equal(r.json.historToolSets.check, null);
+      assert.deepEqual(r.json.historToolSets.value, HISTOR_SET);
+      assert.deepEqual(r.json.pointer.meta[PP][HM], HISTOR_SET, 'the predicted block holds it');
+      assert.ok(r.json.notes.some((n) => n.startsWith(`--histor-tool-sets: pointer.json would also hold _meta["${PP}"]["${HM}"] = ${JSON.stringify(HISTOR_SET)}, the member HISTOR, a third party watcher (https://histor.modelmarket.dev), reads`)));
+    }, { env: ENV });
+    assert.deepEqual(filesUnder(out), ['declaration.unsigned.json']);
+    // The unsigned declaration is the one a run without the option writes.
+    const plain = freshOut();
+    await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--out', plain, ...extra], (r) => assert.equal(r.code, 0), { env: ENV });
+    assert.equal(readOut(out, 'declaration.unsigned.json'), readOut(plain, 'declaration.unsigned.json'));
+  }
+  // The text output shows the member in a note line.
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--out', freshOut(), '--histor-tool-sets', '--dry-run'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.ok(r.stdout.includes('note: --histor-tool-sets: pointer.json would also hold'));
+    assert.ok(r.stdout.includes(JSON.stringify(HISTOR_SET)));
+  });
+});
+
+test('--histor-tool-sets: step 9 fails when the member digests differ from the declaration, and nothing is written', async () => {
+  const builders = {
+    'another digest': () => ({ value: { mtl: '1', sets: [{ digest: OTHER_DIGEST, count: 2 }] }, notes: [] }),
+    'an extra set': () => ({ value: { mtl: '1', sets: [{ digest: tsd.contract.digest, count: 2 }, { digest: OTHER_DIGEST }] }, notes: [] }),
+    'another count': () => ({ value: { mtl: '1', sets: [{ digest: tsd.contract.digest, count: 3 }] }, notes: [] }),
+    'mtl as a number': () => ({ value: { mtl: 1, sets: [{ digest: tsd.contract.digest, count: 2 }] }, notes: [] }),
+  };
+  for (const [what, historToolSetsMember] of Object.entries(builders)) {
+    const out = freshOut();
+    const w = await world({ registry: baseRegistry(), site: baseSite(), extraDeps: { historToolSetsMember } });
+    try {
+      const r = await w.run([NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out, '--histor-tool-sets', '--json'], { env: ENV });
+      assert.equal(r.code, PREPARE_STATES.self_check_failed, `${what}: ${r.stdout}${r.stderr}`);
+      assert.equal(r.json.state, 'self_check_failed');
+      assert.equal(r.json.historToolSets.check, 'failed', what);
+      assert.ok(r.json.reasons.length > 0 && r.json.reasons.every((x) => x.startsWith(`${HM}: `)), `${what}: ${r.json.reasons.join(' | ')}`);
+      assert.match(r.json.steps.find((s) => s.step === 9).line, /the "dev\.modelmarket\.histor\/tool-sets" member does not match the signed declaration; nothing was written/);
+    } finally {
+      await w.close();
+    }
+    assert.deepEqual(filesUnder(out), [], what);
+  }
+});
+
+test('histor-tool-sets.js: the member, its self check and the comparison follow the rules of HISTOR', async () => {
+  const H = await import('../lib/histor-tool-sets.js');
+  const digests = { spec: 'mcp-tool-set-digest/1', contract: tsd.contract.digest, extras: tsd.extras.digest };
+  assert.deepEqual(H.historToolSetsMember(tsd.contract.digest, 2), { value: HISTOR_SET, notes: [] });
+  assert.match(H.historToolSetsMember(tsd.contract.hex, 2).problem, /not in the form HISTOR reads/);
+  const big = H.historToolSetsMember(tsd.contract.digest, 5001);
+  assert.deepEqual(big.value, { mtl: '1', sets: [{ digest: tsd.contract.digest }] });
+  assert.match(big.notes[0], /more than the 5000 HISTOR accepts as "count"/);
+  assert.deepEqual(H.historMemberProblems(HISTOR_SET, digests, 2), []);
+  assert.deepEqual(H.historMemberProblems({ mtl: '1', sets: [{ digest: tsd.contract.digest }] }, digests, 2), [], 'count is optional');
+  assert.ok(H.historMemberProblems({ mtl: '1', sets: [] }, digests, 2).some((p) => /non-empty list/.test(p)));
+  assert.ok(H.historMemberProblems({ mtl: '1', sets: Array.from({ length: 9 }, () => ({ digest: tsd.contract.digest })) }, digests, 2).some((p) => /more than the 8 HISTOR reads/.test(p)));
+  assert.ok(H.historMemberProblems({ mtl: '1', sets: [{ digest: tsd.contract.hex }] }, digests, 2).some((p) => /not in the form HISTOR reads/.test(p)));
+  assert.ok(H.historMemberProblems({ mtl: '1', sets: [{ digest: tsd.extras.digest }] }, digests, 2).some((p) => /the declaration signs the contract digest/.test(p)), 'the extras digest is not the one HISTOR compares');
+  assert.equal(H.compareHistorDigests([tsd.contract.digest], digests), 'all');
+  assert.equal(H.compareHistorDigests([tsd.contract.digest], { contract: tsd.contract.hex }), 'all', 'the hex form of a declaration compares by value');
+  assert.equal(H.compareHistorDigests([tsd.contract.digest, OTHER_DIGEST], digests), 'some');
+  assert.equal(H.compareHistorDigests([OTHER_DIGEST], digests), 'none');
+  assert.equal(H.compareHistorDigests([], digests), null);
+  assert.equal(H.compareHistorDigests([tsd.contract.digest], undefined), null, 'a 0.1 declaration has no contract digest');
+  assert.equal(H.readHistorMember('x').readable, false);
+  assert.equal(H.readHistorMember({ mtl: 1, sets: [{ digest: tsd.contract.digest }] }).readable, false);
+  assert.deepEqual(H.readHistorMember({ mtl: '1', url: 'https://example.com/s.json' }, NAME), { readable: true, problem: null, mtl: '1', sets: 0, digests: [], url: 'https://example.com/s.json', urlRefused: null, skipped: [] });
 });
