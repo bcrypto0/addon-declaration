@@ -1,0 +1,22 @@
+{
+  "spec": "addon-declaration/0.1",
+  "name": "com.rtlpdf/arabic-pdf",
+  "version": "1.0.0",
+  "toolsHash": "sha256:317fad35d11e84f3d5a5c36f308eac5f4ba9329eb803916c707c8bdd4770d833",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://rtlpdf.com/mcp"
+    }
+  ],
+  "contact": "mailto:support@rtlpdf.com",
+  "issuedAt": "2026-11-19T00:08:46Z",
+  "expiresAt": "2027-05-18T00:08:46Z",
+  "key": {
+    "method": "http",
+    "domain": "rtlpdf.com",
+    "alg": "ed25519",
+    "id": "sha256:57b47ffa643b43cc1dedebd1d2438bf5202551175eb289a39fb63e78e808e29c"
+  },
+  "signature": "yjqNudcwRo4PsBFypPzylY+3hQncGF8HhEBPfbMsAvyc+X/OAo2NVYiE68+HBBoM9Wvo/fjGBfsoaBx/M6v/Dw=="
+}

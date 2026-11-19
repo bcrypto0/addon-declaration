@@ -1,0 +1,51 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      {
+        "name": "get_forecast",
+        "title": "Get forecast",
+        "description": "Weather forecast for a place, up to 7 days.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "place": {
+              "type": "string"
+            },
+            "days": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 7
+            }
+          },
+          "required": [
+            "place"
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": true
+        }
+      },
+      {
+        "name": "get_alerts",
+        "title": "Get alerts",
+        "description": "Active weather alerts for a region.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "region": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "region"
+          ]
+        },
+        "annotations": {
+          "readOnlyHint": true
+        }
+      }
+    ]
+  }
+}

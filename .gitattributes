@@ -1,0 +1,15 @@
+# Keep LF line ends on every checkout: the docs test reads Markdown code blocks,
+# and a CRLF shebang in bin/addon-declare.js would break direct execution on Unix.
+* text=auto eol=lf
+*.js text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+bin/* text eol=lf
+# Conformance vectors are compared byte for byte; some are not valid UTF-8 on purpose.
+vectors/**/*.json -text
+testlib/live-0.1/** -text
+examples/live-rtlpdf/*.json -text
+examples/live-rtlpdf/*.txt -text
+# Third party files are kept byte for byte as fetched (their NOTICE names the sha256).
+vectors/third_party/** -text

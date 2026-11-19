@@ -1,0 +1,17 @@
+{
+  "name": "addon-declare",
+  "version": "0.2.0",
+  "description": "Reference signer and verifier for the Add on Declaration Spec v0.2 draft (formats addon-declaration/0.2 and 0.1: signed publisher declarations for MCP servers, using the registry domain key).",
+  "type": "module",
+  "bin": {
+    "addon-declare": "bin/addon-declare.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "private": true,
+  "license": "Apache-2.0"
+}

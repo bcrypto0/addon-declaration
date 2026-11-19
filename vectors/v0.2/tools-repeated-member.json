@@ -1,0 +1,1 @@
+{"tools":[{"name":"get_alerts","description":"Alerts.","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true},"annotations":{"readOnlyHint":false}}]}

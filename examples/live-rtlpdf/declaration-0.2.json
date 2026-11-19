@@ -1,0 +1,27 @@
+{
+  "spec": "addon-declaration/0.2",
+  "name": "com.rtlpdf/arabic-pdf",
+  "version": "1.0.0",
+  "toolSetDigest": {
+    "spec": "mcp-tool-set-digest/1",
+    "contract": "sha256-VPxDXBxVgGzH/0OtZBO1iGClgcDKQSgXmvDHsxe3YTU=",
+    "extras": "sha256-+q4/BoqWmGGjGJw7VgeYkxe99dw6scmRsiGkGhwP8n8="
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://rtlpdf.com/mcp"
+    }
+  ],
+  "contact": "mailto:support@rtlpdf.com",
+  "issuedAt": "2026-11-19T03:14:55Z",
+  "expiresAt": "2027-05-18T03:14:55Z",
+  "previous": "sha256:9170020c77a92f039806c11f714d1aa6eb50780bdb90c27e52016958045baca6",
+  "key": {
+    "method": "http",
+    "domain": "rtlpdf.com",
+    "alg": "ed25519",
+    "id": "sha256:57b47ffa643b43cc1dedebd1d2438bf5202551175eb289a39fb63e78e808e29c"
+  },
+  "signature": "rEUFxobukSfFV22oRrbbYTe4piIK/ceG07mQOnPLUnDEedAg/Z7W+uIjJptZNH7An+6nzd/wF4BDG7rgcQ2cAw=="
+}

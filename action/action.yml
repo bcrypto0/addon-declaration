@@ -1,0 +1,133 @@
+name: Sign add on declaration
+description: Create and sign an Add on Declaration (spec addon-declaration/0.2 by default since 19 November 2026, or addon-declaration/0.1 with format '0.1') with the domain key already used for the MCP Registry. A workflow that sets no format input now writes 0.2.
+
+inputs:
+  private-key:
+    description: The registry private key (the hex value given to mcp-publisher, or a PEM key). Pass a secret.
+    required: true
+  tools-json:
+    description: >-
+      Path to the tools/list result of this server version (a JSON file). If the server paginates,
+      give one path per line, one file per page, in the order the server sent them. Each file holds
+      the JSON text of one page; a response that arrived as server sent events is saved without the
+      "event:" and "data:" framing (SPEC.md section 4).
+    required: true
+  contact:
+    description: A mailto or https contact for questions about this server. Optional for format 0.2, needed for format 0.1 (a 0.1 run without it stops with "give --contact", which means this input).
+    required: false
+    default: ''
+  format:
+    description: >-
+      Declaration format, 0.2 (the default; signs the two mcp-tool-set-digest/1 digests of the tool
+      list in "toolSetDigest") or 0.1 (signs "toolsHash"). Both verify; SPEC.md section 17.
+    required: false
+    default: '0.2'
+  server-json:
+    description: Path to server.json; name, version and remotes are read from it.
+    required: false
+    default: server.json
+  domain:
+    description: Domain holding the key. Defaults to the reverse of the name's namespace.
+    required: false
+    default: ''
+  method:
+    description: Where the key is published, dns or http (as used for registry login).
+    required: false
+    default: dns
+  payment:
+    description: Optional path to a JSON file with the payment option or options.
+    required: false
+    default: ''
+  previous:
+    description: Optional path to the previous signed declaration, to link the history.
+    required: false
+    default: ''
+  expires-in-days:
+    description: Days until the declaration expires.
+    required: false
+    default: '180'
+  output:
+    description: Where to write the signed declaration.
+    required: false
+    default: declaration.json
+  verify-live:
+    description: After signing, look up the published key (dns or http) and verify. Fails the step if the key is not published.
+    required: false
+    default: 'true'
+
+outputs:
+  declaration-path:
+    description: Path of the signed declaration.
+    value: ${{ steps.sign.outputs.path }}
+  declaration-hash:
+    description: Declaration hash, the value a later declaration puts in "previous".
+    value: ${{ steps.sign.outputs.hash }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check Node version
+      shell: bash
+      run: node -e 'const m=+process.versions.node.split(".")[0]; if (m < 20) { console.error("Node 20 or later is needed"); process.exit(1) }'
+
+    # Inputs are passed through env, not pasted into the script, so their text cannot run as shell code.
+    # tools-json may list several files, one per line: each becomes its own --tools, in order.
+    - name: Create and sign
+      id: sign
+      shell: bash
+      env:
+        ADDON_DECLARE_KEY: ${{ inputs.private-key }}
+        CLI: ${{ github.action_path }}/../bin/addon-declare.js
+        IN_TOOLS: ${{ inputs.tools-json }}
+        IN_CONTACT: ${{ inputs.contact }}
+        IN_FORMAT: ${{ inputs.format }}
+        IN_SERVER: ${{ inputs.server-json }}
+        IN_DOMAIN: ${{ inputs.domain }}
+        IN_METHOD: ${{ inputs.method }}
+        IN_PAYMENT: ${{ inputs.payment }}
+        IN_PREVIOUS: ${{ inputs.previous }}
+        IN_DAYS: ${{ inputs.expires-in-days }}
+        IN_OUT: ${{ inputs.output }}
+      run: |
+        set -euo pipefail
+        tools=()
+        while IFS= read -r t || [ -n "$t" ]; do
+          t="${t%$'\r'}"
+          t="${t#"${t%%[![:space:]]*}"}"
+          t="${t%"${t##*[![:space:]]}"}"
+          if [ -n "$t" ]; then tools+=(--tools "$t"); fi
+        done <<< "$IN_TOOLS"
+        if [ "${#tools[@]}" -eq 0 ]; then echo "tools-json names no file" >&2; exit 1; fi
+        args=(init --server-json "$IN_SERVER" "${tools[@]}" --method "$IN_METHOD" --expires-in-days "$IN_DAYS")
+        if [ -n "${IN_FORMAT:-}" ]; then args+=(--format "$IN_FORMAT"); fi
+        if [ -n "${IN_CONTACT:-}" ]; then args+=(--contact "$IN_CONTACT"); fi
+        if [ -n "$IN_DOMAIN" ]; then args+=(--domain "$IN_DOMAIN"); fi
+        if [ -n "$IN_PAYMENT" ]; then args+=(--payment "$IN_PAYMENT"); fi
+        if [ -n "$IN_PREVIOUS" ]; then args+=(--previous "$IN_PREVIOUS"); fi
+        unsigned="$RUNNER_TEMP/declaration.unsigned.json"
+        node "$CLI" "${args[@]}" --out "$unsigned"
+        node "$CLI" sign "$unsigned" --key-env ADDON_DECLARE_KEY --out "$IN_OUT"
+        echo "path=$IN_OUT" >> "$GITHUB_OUTPUT"
+        echo "hash=$(node "$CLI" hash-declaration "$IN_OUT")" >> "$GITHUB_OUTPUT"
+
+    - name: Verify against the published key
+      if: inputs.verify-live == 'true'
+      shell: bash
+      env:
+        CLI: ${{ github.action_path }}/../bin/addon-declare.js
+        IN_TOOLS: ${{ inputs.tools-json }}
+        IN_FORMAT: ${{ inputs.format }}
+        IN_OUT: ${{ inputs.output }}
+      run: |
+        set -euo pipefail
+        tools=()
+        while IFS= read -r t || [ -n "$t" ]; do
+          t="${t%$'\r'}"
+          t="${t#"${t%%[![:space:]]*}"}"
+          t="${t%"${t##*[![:space:]]}"}"
+          if [ -n "$t" ]; then tools+=(--tools "$t"); fi
+        done <<< "$IN_TOOLS"
+        # Check the format the step above wrote, so an older file of the other format does not pass.
+        fmt=()
+        if [ -n "${IN_FORMAT:-}" ]; then fmt=(--format "$IN_FORMAT"); fi
+        node "$CLI" verify "$IN_OUT" "${tools[@]}" ${fmt[@]+"${fmt[@]}"}

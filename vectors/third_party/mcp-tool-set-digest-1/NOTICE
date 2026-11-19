@@ -1,0 +1,28 @@
+Third party files: conformance vectors of mcp-tool-set-digest/1
+
+Source:        https://github.com/alexar76/mcp-tool-set-digest
+Commit:        aca5812571a1784c527401eff5751a916aba77e4 (2026-11-13T19:44:52+01:00)
+Files:         vectors/vectors.json, LICENSE-MIT and LICENSE-APACHE from that commit,
+               copied unchanged (LF line ends, as published)
+Fetched:       2026-11-19, raw bytes from
+               https://raw.githubusercontent.com/alexar76/mcp-tool-set-digest/aca5812571a1784c527401eff5751a916aba77e4/
+               (an earlier copy with CRLF line ends was replaced the same day by these
+               raw bytes)
+sha256:        vectors.json   530c0d876cbf2a22b178f703f145f6e286255267050dd54a6350445e633f88ed
+               LICENSE-MIT    5cc0f26c2644eba9290d80ac2b027afc66f148fee9debf9721ceeeffe29c4d80
+               LICENSE-APACHE e7e97143da6979addfc208e5606219b593f9982831e0f2e4b6408d5c0a655eed
+
+Licence:       The repository's LICENSE file states that its test vectors (vectors/)
+               are licensed under Apache-2.0 OR MIT, at the recipient's option, and its
+               specification text under CC BY 4.0. These vectors are redistributed here
+               under the MIT licence; its copyright and permission notice is in
+               LICENSE-MIT. LICENSE-APACHE is included for the other option.
+               Copyright (c) 2026 AI-Factory Project Contributors (as stated in LICENSE-MIT).
+
+Use here:      test/tool-set-digest.test.js runs all 73 vectors and the equal and
+               differ pairs against lib/tool-set-digest.js, which was written from the
+               specification text (SPEC.md of the same commit), not from its code.
+               No code from that repository is included.
+
+Not changed:   compared byte for byte by the test above (sha256 of all three files,
+               which also must contain no CR byte).

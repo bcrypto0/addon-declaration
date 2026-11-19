@@ -1,0 +1,14 @@
+addon-declare and the Add on Declaration Spec
+Copyright 2026 the addon-declaration authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository includes third party material:
+
+* vectors/third_party/mcp-tool-set-digest-1/: conformance vectors of
+  mcp-tool-set-digest/1, redistributed unchanged under the MIT licence.
+  See the NOTICE and licence files in that folder for source, commit and
+  checksums.
+
+The implementation of mcp-tool-set-digest/1 in lib/tool-set-digest.js was
+written from that document's text, not from its code.

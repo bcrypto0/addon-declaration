@@ -1,0 +1,72 @@
+# Sample workflow for a server repository: sign a declaration when a release is published.
+# Copy to .github/workflows/ in your server repository and replace the marked parts.
+name: Sign add on declaration
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  declare:
+    runs-on: ubuntu-latest
+    # Keep the registry key as a secret of a protected environment limited to
+    # release tags, as the MCP Registry's own CI guidance recommends.
+    environment: mcp-registry-publish
+    permissions:
+      contents: write # to attach the declaration to the release
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # REPLACE: produce the tools/list result of this exact build as tools.json.
+      # For example start the server and send {"jsonrpc":"2.0","id":1,"method":"tools/list"}.
+      # If the server paginates, save each page as its own file (tools-1.json, tools-2.json, ...)
+      # and list them under tools-json below, one path per line, in order. Do not join pages
+      # into one file. If a response arrives as server sent events, save only the JSON-RPC
+      # message carried by its "data:" lines, without the "event:" and "data:" framing.
+      - name: Write tools.json
+        run: |
+          npm ci
+          node scripts/dump-tools.js > tools.json
+
+      # Link the history (SPEC.md sections 7 and 8): fetch the last signed declaration
+      # and pass it as `previous` below. Without this step every release starts a
+      # new chain. Use one of the two sources, then uncomment `previous:` below.
+      # - name: Fetch the previous declaration
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     # From the newest release before this one that has a declaration.json asset:
+      #     prev_tag="$(gh release list --exclude-drafts --limit 2 --json tagName --jq '.[1].tagName')"
+      #     gh release download "$prev_tag" --pattern declaration.json --output previous-declaration.json
+      #     # Or from your website:
+      #     # curl --fail --silent --show-error -o previous-declaration.json https://example.com/.well-known/addon-declaration/com.example/weather/latest.json
+
+      # REPLACE the path with where you keep the action (a pinned commit is safer than a branch).
+      - name: Sign declaration
+        id: declare
+        uses: OWNER/REPO/action@COMMIT_SHA
+        with:
+          private-key: ${{ secrets.MCP_PRIVATE_KEY }}
+          # One file per page, in order; a server that does not paginate has one.
+          tools-json: |
+            tools.json
+          contact: mailto:security@example.com
+          server-json: server.json
+          # payment: payment.json
+          # previous: previous-declaration.json
+          # format: '0.1'   # the earlier format, which signs toolsHash; the default 0.2 signs the two mcp-tool-set-digest/1 digests
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" declaration.json --clobber
+
+      # Then serve declaration.json at
+      # the three paths the sign step printed (SPEC.md section 8):
+      # https://<domain>/.well-known/addon-declaration/<namespace>/<server>/by-hash/<hash>.json (keep all of these),
+      # .../versions/<version>.json and .../latest.json, with whatever deploys your website.
