@@ -8,7 +8,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { STATES, declarationHash, parseDeclarationText } from '../lib/declaration.js';
-import { HELP, parseArgs, COMMAND_FLAGS, LISTING_STATES } from '../lib/cli.js';
+import { HELP, parseArgs, COMMAND_FLAGS, LISTING_STATES, PREPARE_STATES } from '../lib/cli.js';
 import { toolsHashFromText, toolsHash } from '../lib/tools.js';
 import { toolSetDigestsFromPages } from '../lib/tool-set-digest.js';
 import { makeKey, TOOLS } from '../testlib/helpers.js';
@@ -53,7 +53,7 @@ test('every command in README and SPEC uses a command and flags the CLI knows', 
   const cmds = [...documentedCommands(README), ...documentedCommands(SPEC)];
   assert.ok(cmds.length >= 6, `found ${cmds.length} commands`);
   for (const [cmd, ...rest] of cmds) {
-    assert.ok(['hash-tools', 'tool-set-digest', 'hash-declaration', 'init', 'sign', 'verify', 'check-listing'].includes(cmd), `unknown command ${cmd}`);
+    assert.ok(['hash-tools', 'tool-set-digest', 'hash-declaration', 'init', 'sign', 'verify', 'check-listing', 'prepare'].includes(cmd), `unknown command ${cmd}`);
     assert.doesNotThrow(() => parseArgs(rest), `${cmd} ${rest.join(' ')}`);
   }
 });
@@ -90,6 +90,21 @@ test('check-listing states and exit codes agree across code, SPEC, README and he
   // The live example line sits in the README section near the top.
   const top = section(README, '## Check a listing by name', '## Five minute path');
   assert.deepEqual(documentedCommands(top), [['check-listing', 'com.rtlpdf/arabic-pdf', '--fetch-tools']]);
+});
+
+test('prepare states and exit codes agree across code, README and help; its README section reads plainly', () => {
+  const readme = README.replace(/\r\n/g, '\n');
+  for (const [state, code] of Object.entries(PREPARE_STATES)) {
+    assert.ok(readme.includes(`| ${code} | \`${state}\` |`), `README table lists ${code} ${state}`);
+    assert.ok(HELP.replace(/\s+/g, ' ').includes(`${code} ${state}`), `help lists ${code} ${state}`);
+  }
+  const top = section(README, '## Publish a declaration in one command', '## Check a listing by name');
+  assert.ok(README.indexOf('## Publish a declaration in one command') < README.indexOf('## Five minute path'), 'the one command section comes before the manual steps');
+  assert.deepEqual(documentedCommands(top), [['prepare', 'com.example/weather', '--for-version', '1.4.1', '--key-env', 'MCP_PRIVATE_KEY']]);
+  const prose = top.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '').replace(/https?:\/\/\S+/g, '');
+  assert.ok(!/[‒-―−]/.test(prose), 'a dash character');
+  assert.ok(!/\s-\s|\s--\s/.test(prose), 'a hyphen used as a dash');
+  assert.ok(!/\b(never|guaranteed|safe|trusted|secure)\b/i.test(prose), 'a barred word');
 });
 
 test('SPEC section 8a and the README listing section: no dash punctuation and none of the barred words', () => {
