@@ -27,7 +27,7 @@ test('the live 0.1 declaration: same bytes, same hashes, still valid', async () 
   const r = await verifyDeclarationText(DECL, { keySource: { kind: 'offline', keys: KEY }, now: Date.parse('2026-11-19T12:00:00Z'), toolsText: [TOOLS] });
   assert.equal(r.state, 'valid', r.reasons.join('; '));
   assert.equal(r.details.format, SPEC_ID_01);
-  assert.deepEqual(r.details.checked, ['name: namespace covered by a http key at rtlpdf.com', 'signature', 'time window', 'tools hash']);
+  assert.deepEqual(r.details.checked, ['name: namespace covered by an http key at rtlpdf.com', 'signature', 'time window', 'tools hash']);
   assert.equal(r.details.declarationHash, 'sha256:9170020c77a92f039806c11f714d1aa6eb50780bdb90c27e52016958045baca6');
   // Valid until its own expiry, and not after.
   assert.equal((await verifyDeclarationText(DECL, { keySource: { kind: 'offline', keys: KEY }, now: Date.parse('2027-05-18T00:08:45Z') })).state, 'valid');

@@ -8,7 +8,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { STATES, declarationHash, parseDeclarationText } from '../lib/declaration.js';
-import { HELP, parseArgs, COMMAND_FLAGS } from '../lib/cli.js';
+import { HELP, parseArgs, COMMAND_FLAGS, LISTING_STATES } from '../lib/cli.js';
 import { toolsHashFromText, toolsHash } from '../lib/tools.js';
 import { toolSetDigestsFromPages } from '../lib/tool-set-digest.js';
 import { makeKey, TOOLS } from '../testlib/helpers.js';
@@ -53,17 +53,52 @@ test('every command in README and SPEC uses a command and flags the CLI knows', 
   const cmds = [...documentedCommands(README), ...documentedCommands(SPEC)];
   assert.ok(cmds.length >= 6, `found ${cmds.length} commands`);
   for (const [cmd, ...rest] of cmds) {
-    assert.ok(['hash-tools', 'tool-set-digest', 'hash-declaration', 'init', 'sign', 'verify'].includes(cmd), `unknown command ${cmd}`);
+    assert.ok(['hash-tools', 'tool-set-digest', 'hash-declaration', 'init', 'sign', 'verify', 'check-listing'].includes(cmd), `unknown command ${cmd}`);
     assert.doesNotThrow(() => parseArgs(rest), `${cmd} ${rest.join(' ')}`);
   }
 });
 
+// The rows "| `state` | code |" of the verify table of section 11, and of the
+// listing check table that follows it.
+const LISTING_TABLE = '| Listing check state |';
+function stateRows(md) {
+  return Object.fromEntries([...md.matchAll(/^\| `([a-z_]+)` \| (\d+) \|/gm)].map((m) => [m[1], Number(m[2])]));
+}
+
 test('result states and exit codes agree across code, SPEC, README and help', () => {
-  const specRows = Object.fromEntries([...SPEC.matchAll(/^\| `([a-z_]+)` \| (\d+) \|/gm)].map((m) => [m[1], Number(m[2])]));
-  assert.deepEqual(specRows, { ...STATES });
+  const s = SPEC.replace(/\r\n/g, '\n');
+  const at = s.indexOf(LISTING_TABLE);
+  assert.ok(at > 0, 'SPEC has the listing check table');
+  assert.deepEqual(stateRows(s.slice(0, at)), { ...STATES });
   for (const [state, code] of Object.entries(STATES)) {
     assert.ok(README.includes(`${code} ${state}`), `README lists ${code} ${state}`);
     assert.ok(HELP.includes(`${code} ${state}`), `help lists ${code} ${state}`);
+  }
+});
+
+test('check-listing states and exit codes agree across code, SPEC, README and help', () => {
+  const s = SPEC.replace(/\r\n/g, '\n');
+  const table = s.slice(s.indexOf(LISTING_TABLE), s.indexOf('Display guidance'));
+  const own = Object.fromEntries(Object.entries(LISTING_STATES).filter(([k]) => !Object.hasOwn(STATES, k)));
+  assert.deepEqual(stateRows(table), own);
+  for (const [state, code] of Object.entries(STATES)) if (state !== 'valid') assert.equal(LISTING_STATES[state], code, `${state} keeps the exit code of verify`);
+  const readme = README.replace(/\r\n/g, '\n');
+  for (const [state, code] of Object.entries(own)) {
+    assert.ok(readme.includes(`| ${code} | \`${state}\` |`), `README table lists ${code} ${state}`);
+    assert.ok(HELP.replace(/\s+/g, ' ').includes(`${code} ${state}`), `help lists ${code} ${state}`);
+  }
+  // The live example line sits in the README section near the top.
+  const top = section(README, '## Check a listing by name', '## Five minute path');
+  assert.deepEqual(documentedCommands(top), [['check-listing', 'com.rtlpdf/arabic-pdf', '--fetch-tools']]);
+});
+
+test('SPEC section 8a and the README listing section: no dash punctuation and none of the barred words', () => {
+  const parts = [section(SPEC, '## 8a.', '## 9.'), section(SPEC, 'T18.', '## 13.'), section(SPEC, 'Result states of a listing check', 'Display guidance'), section(README, '## Check a listing by name', '## Five minute path')];
+  for (const p of parts) {
+    const prose = p.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '').replace(/https?:\/\/\S+/g, '');
+    assert.ok(!/[‒-―−]/.test(prose), 'a dash character');
+    assert.ok(!/\s-\s|\s--\s/.test(prose), 'a hyphen used as a dash');
+    assert.ok(!/\bguaranteed\b/i.test(prose), 'a promise word');
   }
 });
 

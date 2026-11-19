@@ -129,7 +129,7 @@ test('http fetch: non public addresses are dropped and not dialed; none left mea
   assert.deepEqual(dialed, []);
   // A public A record next to a ULA or NAT64 record: the registry uses the public one, and so does this.
   const mixed = [{ address: 'fd00::1', family: 6 }, { address: '93.184.215.14', family: 4 }, { address: '64:ff9b::7f00:1', family: 6 }, { address: '8.8.8.8', family: 4 }];
-  await assert.rejects(httpsGetText('https://good.example/.well-known/mcp-registry-auth', { lookupAll: async () => mixed, transport, attempts: 1 }), /all resolved public addresses failed/);
+  await assert.rejects(httpsGetText('https://good.example/.well-known/mcp-registry-auth', { lookupAll: async () => mixed, transport, attempts: 1 }), /every address tried failed/);
   assert.deepEqual(dialed, ['93.184.215.14', '8.8.8.8'], 'only the public addresses, in order');
 });
 

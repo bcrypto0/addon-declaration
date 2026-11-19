@@ -6,6 +6,36 @@ Status: draft v0.2. Licence: Apache 2.0 (see `LICENSE`; third party vectors unde
 
 Every command below is one line, so it works the same in bash, zsh, cmd and PowerShell.
 
+## Check a listing by name
+
+```
+node bin/addon-declare.js check-listing com.rtlpdf/arabic-pdf --fetch-tools
+```
+
+This reads the listing from the official MCP Registry, finds the declaration it points to (`_meta["io.modelcontextprotocol.registry/publisher-provided"].addonDeclaration`), fetches it from the publisher's own domain, checks that it is the file the listing names (by hash) and that its name, version and remotes equal the listing's, and verifies it with the key the domain publishes. It then looks for a newer declaration for the same version next to it (`versions/<version>.json`, `latest.json`) and puts it in force only if its history leads back to the named one under the same key. `--fetch-tools` reads the tool list from the declared remote (MCP protocol version 2026-07-28, or the `initialize` flow for an older server; the output says which) and compares it with the declaration in force; `--tools tools.json` compares saved pages instead. Add `--version 1.0.0` for a version other than the latest, `--registry <https base URL>` for another registry or mirror with the same API, `--json` for machine output. The rules it follows, and the attacks they close, are in SPEC.md section 8a. The registry asks host applications to read it through aggregators, so use this for checks by hand.
+
+If the declaration the listing names has expired, a renewed declaration for the same version that follows it under the same key is still found and put in force. The declaration in force is the newest one the publisher's site served, which is not proof that no newer one exists (SPEC.md section 8a). Every string taken from the listing or a server is escaped before it is printed, and long ones are cut short in the text output. `check-listing --help` prints the options of this command alone. Exit codes:
+
+| Exit code | State | Meaning |
+|---|---|---|
+| 0 | `verified` | the named declaration verifies and is in force; every check that was run passed |
+| 11 | `verified_newer_declaration` | a newer declaration for the same version that follows the named one under the same key is in force and verifies (the named one verifies or has only expired) |
+| 2 to 10 | as for `verify` | the declaration check failed (for example 3 `invalid_signature`, 8 `tools_hash_mismatch`) |
+| 12 | `no_declaration` | the listing points to no declaration |
+| 13 | `pointer_malformed` | the pointer is not `{ "url", "hash" }` with a declaration hash |
+| 14 | `pointer_refused` | the pointer URL is not the by-hash path on the domain the namespace names or a parent of it; nothing was fetched |
+| 15 | `namespace_out_of_scope` | an `io.github` name |
+| 16 | `declaration_unreachable` | the declaration could not be fetched (a redirect is not followed) |
+| 17 | `declaration_not_the_named_one` | the served file is not the one the pointer hash names |
+| 18 | `listing_mismatch` | name, version or remotes differ between listing and declaration |
+| 19 | `tools_fetch_failed` | the tool list could not be read from the declared remote (a server that asks for authorization is reported as not checked instead) |
+| 20 | `registry_not_found` | no listing for this name and version (a deleted version too) |
+| 21 | `registry_unreachable` | the registry could not be read |
+| 22 | `registry_response_invalid` | the registry's answer is not the listing asked for |
+| 1 | | usage or file error |
+
+A program that reads only the exit code treats 0 and 11 as passed. With `--fetch-tools`, 0 and 11 do not mean that the tool list was compared: a server that asks for authorization leaves the tool check not checked, and the exit code stays 0 or 11. The text output then prints a `tools: NOT CHECKED` line under the state; in `--json`, read `tools.check` (`run`, `not_run`, `not_checked` or `failed`) and `tools.result` (`match` when the list was compared and matched).
+
 ## Five minute path for a publisher
 
 You need: a server published under a domain namespace (like `com.example/weather`) with `mcp-publisher login dns` or `login http`, and the private key you made for that login. If you would rather keep the registry login key out of release CI, you can sign with a separate declaration only key instead (dns method only, SPEC.md section 9).
@@ -123,13 +153,13 @@ The implementation (`lib/tool-set-digest.js`) was written from that document's t
 
 From this folder: `node --test`. The tests make their own throwaway keys and use no network; the http fetch tests use a local server on 127.0.0.1. On Node 24.22.1 (checked 18 November 2026) the form `node --test .` stops with "Could not find '.'", because newer runners read arguments as glob patterns; `node --test` with no argument finds the suites.
 
-The fixed conformance vectors are in `vectors/` (`manifest.json` lists each input with its expected state, exit code and hashes); `test/vectors.test.js` runs them. The vectors of format 0.2 are in `vectors/v0.2/`, with their own `manifest.json`, written by `vectors/generate-0.2.js`; `test/vectors-0.2.test.js` runs them and checks that the 0.1 vector files are unchanged. Another implementation can run the same files. `test/live-0.1.test.js` checks that a live 0.1 declaration (copied into `testlib/live-0.1/`) still verifies with the same hashes.
+The fixed conformance vectors are in `vectors/` (`manifest.json` lists each input with its expected state, exit code and hashes); `test/vectors.test.js` runs them. The vectors of format 0.2 are in `vectors/v0.2/`, with their own `manifest.json`, written by `vectors/generate-0.2.js`; `test/vectors-0.2.test.js` runs them and checks that the 0.1 vector files are unchanged. Another implementation can run the same files. `test/live-0.1.test.js` checks that a live 0.1 declaration (copied into `testlib/live-0.1/`) still verifies with the same hashes. `test/check-listing.test.js` runs `check-listing` against local doubles of the registry, the publisher's site and an MCP server (modern and legacy, JSON and event stream answers, paging, sessions, a 401), and reaches every state; it also covers hostile history links and MCP answers, an expired pointer with a renewed declaration, and the time limit of a whole check.
 
 ## Files
 
 * `SPEC.md`: Declaration Spec v0.2 draft (format 0.1 in sections 3 to 15, format 0.2 in section 17)
 * `bin/addon-declare.js`: the CLI entry point; the command logic is in `lib/cli.js`
-* `lib/`: canonical JSON (`jcs.js`), keys (`keys.js`), tools hash (`tools.js`), the two digests of mcp-tool-set-digest/1 (`tool-set-digest.js`), rules and verification (`declaration.js`), live key lookup (`resolve.js`, the only file that uses the network)
+* `lib/`: canonical JSON (`jcs.js`), keys (`keys.js`), tools hash (`tools.js`), the two digests of mcp-tool-set-digest/1 (`tool-set-digest.js`), rules and verification (`declaration.js`), the listing check (`listing.js`) and its minimal MCP client (`mcp-client.js`), live key lookup and the hardened fetch (`resolve.js`, the only file that opens network connections; every request of the other files goes through it)
 * `test/`: `node:test` suites; `testlib/`: shared test fixtures (outside `test/` so the runner does not count them as a suite)
 * `vectors/`: conformance vectors of format 0.1 and `generate.js`, which wrote them; `vectors/v0.2/`: those of format 0.2, written by `vectors/generate-0.2.js`; `vectors/third_party/mcp-tool-set-digest-1/`: the vectors of mcp-tool-set-digest/1, with `NOTICE` and licence files
 * `action/action.yml`, `examples/workflows/sign-declaration.yml`: signing on release
